@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shutil
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -19,6 +21,11 @@ try:
     from rank_bm25 import BM25Okapi
 except Exception:  # pragma: no cover
     BM25Okapi = None
+
+from local_archive_ai.logging_config import log
+
+_MAX_CHECKPOINTS = 3
+_CHECKPOINT_INTERVAL = 1000  # chunks
 
 
 @dataclass
@@ -106,6 +113,138 @@ class LocalVectorStore:
         faiss.write_index(self.index, str(self.index_file))
         self._prepare_bm25()
         self._write_metadata()
+        log.info("Index built: %d vectors, dim=%d", self.index.ntotal, dim)
+
+    # ------------------------------------------------------------------
+    # Incremental indexing (Problem J)
+    # ------------------------------------------------------------------
+    def add_vectors(
+        self,
+        new_vectors: np.ndarray,
+        new_metadata: list[dict[str, Any]],
+        new_file_hashes: dict[str, str] | None = None,
+    ) -> None:
+        """Add vectors without rebuilding the entire index."""
+        new_vectors = new_vectors.astype("float32")
+        new_vectors = self._normalize(new_vectors)
+        if self.index is None:
+            dim = new_vectors.shape[1]
+            self.index = faiss.IndexFlatIP(dim)
+        self.index.add(new_vectors)
+        self.metadata.extend(new_metadata)
+        if new_file_hashes:
+            self.file_hashes.update(new_file_hashes)
+        faiss.write_index(self.index, str(self.index_file))
+        self._prepare_bm25()
+        self._write_metadata()
+        log.info("Incremental add: +%d vectors (total %d)", len(new_metadata), self.index.ntotal)
+
+    def delete_document(self, file_path: str) -> int:
+        """Remove all chunks belonging to *file_path* and rebuild the index."""
+        if not self.metadata:
+            return 0
+        keep_indices = [i for i, m in enumerate(self.metadata) if m.get("file_path") != file_path]
+        removed = len(self.metadata) - len(keep_indices)
+        if removed == 0:
+            return 0
+        # Reconstruct vectors for kept items
+        if self.index is not None and keep_indices:
+            kept_vectors = np.array(
+                [self.index.reconstruct(int(i)) for i in keep_indices], dtype=np.float32
+            )
+            self.metadata = [self.metadata[i] for i in keep_indices]
+            self.file_hashes.pop(file_path, None)
+            dim = kept_vectors.shape[1]
+            self.index = faiss.IndexFlatIP(dim)
+            self.index.add(kept_vectors)
+            faiss.write_index(self.index, str(self.index_file))
+        else:
+            self.metadata = []
+            self.file_hashes.pop(file_path, None)
+            self.index = None
+        self._prepare_bm25()
+        self._write_metadata()
+        log.info("Deleted %d chunks for %s", removed, file_path)
+        return removed
+
+    # ------------------------------------------------------------------
+    # Checkpoint / backup (Problem T)
+    # ------------------------------------------------------------------
+    def save_checkpoint(self) -> Path | None:
+        """Save a timestamped checkpoint of the index + metadata."""
+        cp_dir = self.storage_path / "checkpoints"
+        cp_dir.mkdir(parents=True, exist_ok=True)
+        ts = int(time.time())
+        dest = cp_dir / f"checkpoint_{ts}"
+        dest.mkdir(parents=True, exist_ok=True)
+        try:
+            if self.index_file.exists():
+                shutil.copy2(str(self.index_file), str(dest / "index.faiss"))
+            if self.metadata_file.exists():
+                shutil.copy2(str(self.metadata_file), str(dest / "metadata.json"))
+            self._prune_old_checkpoints(cp_dir)
+            log.info("Checkpoint saved: %s", dest)
+            return dest
+        except Exception:
+            log.exception("Checkpoint save failed")
+            return None
+
+    def list_checkpoints(self) -> list[Path]:
+        cp_dir = self.storage_path / "checkpoints"
+        if not cp_dir.exists():
+            return []
+        return sorted(cp_dir.iterdir(), key=lambda p: p.name, reverse=True)
+
+    def rollback_checkpoint(self, checkpoint_path: Path) -> bool:
+        """Restore index from a checkpoint directory."""
+        idx_src = checkpoint_path / "index.faiss"
+        meta_src = checkpoint_path / "metadata.json"
+        if not idx_src.exists() or not meta_src.exists():
+            return False
+        try:
+            shutil.copy2(str(idx_src), str(self.index_file))
+            shutil.copy2(str(meta_src), str(self.metadata_file))
+            self.load()
+            log.info("Rolled back to checkpoint %s", checkpoint_path.name)
+            return True
+        except Exception:
+            log.exception("Rollback failed")
+            return False
+
+    @staticmethod
+    def _prune_old_checkpoints(cp_dir: Path) -> None:
+        existing = sorted(cp_dir.iterdir(), key=lambda p: p.name)
+        while len(existing) > _MAX_CHECKPOINTS:
+            oldest = existing.pop(0)
+            shutil.rmtree(str(oldest), ignore_errors=True)
+
+    # ------------------------------------------------------------------
+    # Export / Import (Problem S)
+    # ------------------------------------------------------------------
+    def export_index(self, dest: Path) -> Path:
+        """Export index + metadata as a zip."""
+        import zipfile
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        with zipfile.ZipFile(str(dest), "w", zipfile.ZIP_DEFLATED) as zf:
+            if self.index_file.exists():
+                zf.write(str(self.index_file), "index.faiss")
+            if self.metadata_file.exists():
+                zf.write(str(self.metadata_file), "metadata.json")
+        log.info("Index exported to %s", dest)
+        return dest
+
+    def import_index(self, src: Path) -> bool:
+        """Import index from a zip file."""
+        import zipfile
+        if not src.exists():
+            return False
+        try:
+            with zipfile.ZipFile(str(src), "r") as zf:
+                zf.extractall(str(self.storage_path))
+            return self.load()
+        except Exception:
+            log.exception("Index import failed")
+            return False
 
     def load(self) -> bool:
         self.load_error = ""
@@ -249,4 +388,11 @@ class LocalVectorStore:
         if not vectors:
             return np.empty((0, 0), dtype=np.float32)
         return np.asarray(vectors, dtype=np.float32)
+
+    def chunk_count(self) -> int:
+        return len(self.metadata)
+
+    def is_file_unchanged(self, file_path: str, file_hash: str) -> bool:
+        """Check if a file's hash matches the stored hash (Problem H)."""
+        return self.file_hashes.get(file_path) == file_hash
 

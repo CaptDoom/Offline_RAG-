@@ -25,7 +25,16 @@ class AppConfig(BaseModel):
     ocr_engine: str = Field(default="tesseract", pattern=r"^(tesseract|easyocr)$", description="OCR engine to use")
     bm25_weight: float = Field(default=0.4, ge=0.0, le=1.0, description="Weight for BM25 in hybrid search")
     rerank_top_n: int = Field(default=5, ge=1, description="Number of top results to rerank")
-    retrieval_mode: str = Field(default="vector", pattern=r"^(vector|hybrid|hybrid\+rerank)$", description="Retrieval mode: vector, hybrid, or hybrid+rerank")
+    retrieval_mode: str = Field(default="vector", pattern=r"^(vector|hybrid|hybrid\+rerank)$", description="Retrieval mode")
+    # --- Overhaul additions ---
+    temperature: float = Field(default=0.7, ge=0.0, le=2.0, description="LLM temperature")
+    confidence_threshold: float = Field(default=0.65, ge=0.0, le=1.0, description="Min similarity for confident answer")
+    enable_watcher: bool = Field(default=False, description="Enable folder watcher for auto-indexing")
+    watcher_folder: str = Field(default="", description="Folder to watch for new documents")
+    query_cache_ttl: int = Field(default=3600, ge=0, description="Query cache TTL in seconds (0 to disable)")
+    embedding_batch_size: int = Field(default=50, ge=1, description="Batch size for embedding generation")
+    ocr_workers: int = Field(default=0, ge=0, description="OCR parallel workers (0 = auto)")
+    max_context_tokens: int = Field(default=8192, ge=512, description="Max context window tokens for LLM")
 
 
 def _default_config_path() -> Path:
@@ -65,8 +74,12 @@ def load_config(path: Path | None = None) -> AppConfig:
         _check_duplicate_keys(content)
         payload: dict[str, Any] = yaml.safe_load(content) or {}
 
+    # Strip unknown keys so old configs still load after adding new fields
+    known_fields = set(AppConfig.model_fields.keys())
+    cleaned = {k: v for k, v in payload.items() if k in known_fields}
+
     try:
-        config = AppConfig(**payload)
+        config = AppConfig(**cleaned)
     except ValidationError as e:
         raise ValueError(f"Config validation error: {e}") from e
 

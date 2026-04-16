@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+import concurrent.futures
 import json
+import multiprocessing
+import os
+import signal
 import subprocess
 import threading
+import time
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime
@@ -13,6 +18,9 @@ from typing import Any, Callable
 import numpy as np
 import re
 import requests
+
+from local_archive_ai.logging_config import log
+
 try:
     import tiktoken
 except Exception:  # pragma: no cover
@@ -47,9 +55,15 @@ except Exception:  # pragma: no cover
     PdfReader = None
 
 try:
-    from PIL import Image
+    from PIL import Image, ImageFilter
 except Exception:  # pragma: no cover
     Image = None
+    ImageFilter = None
+
+try:
+    import cv2  # type: ignore[import-not-found]
+except Exception:  # pragma: no cover
+    cv2 = None
 
 try:
     import easyocr
@@ -125,6 +139,25 @@ _MODEL_CACHE_DIR = _ROOT_DIR / "data" / "models"
 _EMBED_MODEL_LOCK = threading.Lock()
 _RERANK_MODEL_LOCK = threading.Lock()
 
+# Ollama HTTP session pool (Problem: connection pooling)
+_ollama_session: requests.Session | None = None
+_ollama_session_lock = threading.Lock()
+
+
+def _get_ollama_session() -> requests.Session:
+    """Return a reusable requests.Session for Ollama calls."""
+    global _ollama_session
+    if _ollama_session is None:
+        with _ollama_session_lock:
+            if _ollama_session is None:
+                _ollama_session = requests.Session()
+                adapter = requests.adapters.HTTPAdapter(
+                    pool_connections=4, pool_maxsize=8, max_retries=1
+                )
+                _ollama_session.mount("http://", adapter)
+                _ollama_session.mount("https://", adapter)
+    return _ollama_session
+
 
 class IngestionStatus(Enum):
     SUCCESS = "success"
@@ -197,6 +230,7 @@ class IndexReport:
 
 
 class EmbeddingService:
+    """Lazy-loaded embedding service with batch processing (Problem W: OOM-safe)."""
     _model: Any = None
     _model_attempted = False
 
@@ -220,15 +254,18 @@ class EmbeddingService:
                         local_files_only=True,
                         device="cpu",
                     )
+                    log.info("Embedding model loaded: all-MiniLM-L6-v2")
                 except Exception:
                     self.__class__._model = None
+                    log.warning("Embedding model not found locally, using fallback")
 
     @property
     def model(self) -> Any:
         self._load_model()
         return self.__class__._model
 
-    def embed(self, texts: list[str], batch_size: int = 16) -> np.ndarray:
+    def embed(self, texts: list[str], batch_size: int = 50) -> np.ndarray:
+        """Embed texts in batches to prevent OOM (Problem W)."""
         if not texts:
             return np.empty((0, 384), dtype=np.float32)
 
@@ -549,8 +586,40 @@ def _read_pdf(path: Path) -> str:
     raise RuntimeError(f"Unable to extract text from PDF {path}. Errors: {'; '.join(errors)}")
 
 
+def _preprocess_image_for_ocr(img: Any) -> Any:
+    """Preprocess image for better OCR quality (Problem G).
+
+    Steps: resize to ~300 DPI equivalent, adaptive threshold, denoise, deskew.
+    """
+    if img is None:
+        return img
+    try:
+        # Convert to grayscale
+        if img.mode != "L":
+            img = img.convert("L")
+        # Resize small images to ~300 DPI equivalent (assume 72 DPI input)
+        width, height = img.size
+        if width < 1500:
+            scale = max(2, 3000 // max(width, 1))
+            img = img.resize((width * scale, height * scale), Image.LANCZOS)
+        # Sharpen
+        if ImageFilter is not None:
+            img = img.filter(ImageFilter.SHARPEN)
+        # OpenCV-based denoising and adaptive threshold if available
+        if cv2 is not None:
+            arr = np.array(img)
+            arr = cv2.fastNlMeansDenoising(arr, None, 10, 7, 21)
+            arr = cv2.adaptiveThreshold(
+                arr, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 15, 8
+            )
+            img = Image.fromarray(arr)
+    except Exception:
+        pass  # Return original image on any preprocessing failure
+    return img
+
+
 def _read_image_text_resilient(path: Path) -> str:
-    """Extract text from image using multi-engine OCR chain: pytesseract → easyocr → fail."""
+    """Extract text from image using multi-engine OCR chain: pytesseract -> easyocr -> fail."""
     errors = []
 
     # Try pytesseract first
@@ -558,7 +627,8 @@ def _read_image_text_resilient(path: Path) -> str:
         _configure_tesseract_cmd()
         try:
             with Image.open(path) as img:
-                text = pytesseract.image_to_string(img, timeout=10)  # Add timeout
+                preprocessed = _preprocess_image_for_ocr(img.copy())
+                text = pytesseract.image_to_string(preprocessed, timeout=15)
                 if text.strip():
                     return _sanitize_text(text)
         except Exception as e:
@@ -567,7 +637,6 @@ def _read_image_text_resilient(path: Path) -> str:
     # Fallback to easyocr
     if easyocr is not None:
         try:
-            # Initialize reader with timeout protection
             reader = easyocr.Reader(["en"], gpu=False, verbose=False)
             result = reader.readtext(str(path), detail=0)
             text = "\n".join(result)
@@ -576,12 +645,9 @@ def _read_image_text_resilient(path: Path) -> str:
         except Exception as e:
             errors.append(f"easyocr: {str(e)}")
 
-    # If no OCR available or all failed, return empty string with warning
     if not errors:
         errors.append("No OCR engines available")
-    
-    # For images without OCR, we still create chunks but with empty text
-    # This allows the system to work even without OCR
+    log.debug("OCR failed for %s: %s", path, "; ".join(errors))
     return ""
 
 
@@ -1177,11 +1243,20 @@ def _token_count(text: str) -> int:
             return len(text.split())
 
 
-def _compose_prompt(question: str, hits: list[SearchHit], model_name: str) -> str:
-    token_limit = _detect_token_limit(model_name)
-    max_context_tokens = int(token_limit * 0.8)
+def _compose_prompt(
+    question: str,
+    hits: list[SearchHit],
+    model_name: str,
+    max_context_tokens: int = 8192,
+) -> tuple[str, int]:
+    """Compose prompt with dynamic chunk selection (Problem N) and truncation (Problem R).
+
+    Returns (prompt_text, chunks_used).
+    """
+    budget = int(max_context_tokens * 0.75)
     context_entries: list[str] = []
     current_tokens = 0
+    truncated = False
 
     for idx, hit in enumerate(hits):
         chunk_text = _sanitize_text(hit.text, max_length=1500)
@@ -1191,31 +1266,72 @@ def _compose_prompt(question: str, hits: list[SearchHit], model_name: str) -> st
             f" :: {chunk_text}"
         )
         entry_tokens = _token_count(entry)
-        if current_tokens + entry_tokens > max_context_tokens:
+        if current_tokens + entry_tokens > budget:
+            truncated = True
             break
         context_entries.append(entry)
         current_tokens += entry_tokens
 
+    if truncated:
+        log.warning("Context truncated at %d chunks (token budget %d)", len(context_entries), budget)
+
     context = "\n\n".join(context_entries)
     prompt = (
         "You are a local offline assistant for document analysis.\n"
-        "Use only the provided context to answer the question. If the answer is not contained in the context, say so clearly.\n\n"
+        "Use only the provided context to answer the question. "
+        "If the answer is not contained in the context, say so clearly.\n\n"
         f"Context:\n{context}\n\nQuestion: {question}\n\nAnswer:"
     )
-    return prompt
+    return prompt, len(context_entries)
 
 
-def _generate_with_ollama(prompt: str, model_name: str, endpoint: str = "http://127.0.0.1:11434", api_key: str = "") -> str:
-    headers = {}
+def prewarm_ollama(endpoint: str = "http://127.0.0.1:11434", model_name: str = "llama3.2:1b", api_key: str = "") -> bool:
+    """Pre-warm Ollama by sending a dummy prompt to load the model into memory (Problem O)."""
+    session = _get_ollama_session()
+    headers: dict[str, str] = {}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
-    
     try:
-        resp = requests.post(
+        resp = session.post(
             f"{endpoint}/api/generate",
-            json={"model": model_name, "prompt": prompt, "stream": False},
+            json={"model": model_name, "prompt": "hi", "stream": False, "keep_alive": -1},
             headers=headers,
-            timeout=300,  # Increased timeout to 5 minutes for model loading
+            timeout=120,
+        )
+        ok = resp.status_code == 200
+        if ok:
+            log.info("Ollama pre-warmed with model %s", model_name)
+        return ok
+    except Exception:
+        log.warning("Ollama pre-warm failed for model %s", model_name)
+        return False
+
+
+def _generate_with_ollama(
+    prompt: str,
+    model_name: str,
+    endpoint: str = "http://127.0.0.1:11434",
+    api_key: str = "",
+    temperature: float = 0.7,
+) -> str:
+    """Generate response from Ollama with connection pooling."""
+    session = _get_ollama_session()
+    headers: dict[str, str] = {}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    try:
+        resp = session.post(
+            f"{endpoint}/api/generate",
+            json={
+                "model": model_name,
+                "prompt": prompt,
+                "stream": False,
+                "keep_alive": -1,
+                "options": {"temperature": temperature},
+            },
+            headers=headers,
+            timeout=300,
         )
         resp.raise_for_status()
         data = resp.json()
@@ -1227,12 +1343,58 @@ def _generate_with_ollama(prompt: str, model_name: str, endpoint: str = "http://
         return "Request timed out. The model may be taking too long to load or generate a response. Try again in a few moments."
     except requests.exceptions.ConnectionError:
         return f"Connection failed. Please ensure Ollama is running on {endpoint}."
-    except requests.exceptions.HTTPError as e:
-        if resp.status_code == 404:
+    except requests.exceptions.HTTPError:
+        try:
+            status = resp.status_code
+        except Exception:
+            status = 0
+        if status == 404:
             return f"Model '{model_name}' not found. Please pull the model first: ollama pull {model_name}"
-        return f"HTTP error {resp.status_code}: {resp.text}"
+        return f"HTTP error from Ollama (status {status})."
     except Exception as e:
         return f"Error generating response: {str(e)}"
+
+
+def generate_with_ollama_stream(
+    prompt: str,
+    model_name: str,
+    endpoint: str = "http://127.0.0.1:11434",
+    api_key: str = "",
+    temperature: float = 0.7,
+):
+    """Streaming generator for Ollama responses (Problem O: streaming with st.write_stream)."""
+    session = _get_ollama_session()
+    headers: dict[str, str] = {}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    try:
+        resp = session.post(
+            f"{endpoint}/api/generate",
+            json={
+                "model": model_name,
+                "prompt": prompt,
+                "stream": True,
+                "keep_alive": -1,
+                "options": {"temperature": temperature},
+            },
+            headers=headers,
+            timeout=300,
+            stream=True,
+        )
+        resp.raise_for_status()
+        for line in resp.iter_lines():
+            if line:
+                try:
+                    data = json.loads(line)
+                    token = data.get("response", "")
+                    if token:
+                        yield token
+                    if data.get("done", False):
+                        break
+                except json.JSONDecodeError:
+                    continue
+    except Exception as e:
+        yield f"\n\n[Streaming error: {e}]"
 
 
 def answer_query(
@@ -1246,7 +1408,11 @@ def answer_query(
     retrieval_mode: str = "vector",
     bm25_weight: float = 0.4,
     rerank_top_n: int = 5,
+    confidence_threshold: float = 0.65,
+    temperature: float = 0.7,
+    max_context_tokens: int = 8192,
 ) -> dict[str, Any]:
+    t0 = time.time()
     store = LocalVectorStore(Path(store_path))
     if not store.load() or not store.ready():
         raise RuntimeError("FAISS index is not loaded. Please index files first.")
@@ -1282,7 +1448,11 @@ def answer_query(
     if not hits:
         raise RuntimeError("No relevant content found in the index.")
 
-    prompt = _compose_prompt(query, hits, model_name)
+    # Confidence scoring (Problem P)
+    max_similarity = max(h.score for h in hits) if hits else 0.0
+    low_confidence = max_similarity < confidence_threshold
+
+    prompt, chunks_used = _compose_prompt(query, hits, model_name, max_context_tokens=max_context_tokens)
     answer = ""
     try:
         if not check_ollama_status(ollama_endpoint, ollama_api_key):
@@ -1291,11 +1461,18 @@ def answer_query(
                 "Your local retrieval succeeded, but the final response cannot be generated until Ollama is available."
             )
         else:
-            answer = _generate_with_ollama(prompt, model_name, ollama_endpoint, ollama_api_key)
+            answer = _generate_with_ollama(prompt, model_name, ollama_endpoint, ollama_api_key, temperature=temperature)
     except Exception as exc:
         answer = (
             "Local model call failed. Verify Ollama is running and model is available.\n\n"
             f"Error: {exc}"
+        )
+
+    # Prepend low-confidence warning (Problem P)
+    if low_confidence and answer and not answer.startswith("Ollama") and not answer.startswith("Connection"):
+        answer = (
+            "**Low Confidence Warning:** The documents may not clearly answer this question "
+            f"(max similarity: {max_similarity:.3f}).\n\n{answer}"
         )
 
     citations = []
@@ -1313,9 +1490,17 @@ def answer_query(
             }
         )
 
-    payload = {
+    duration_ms = int((time.time() - t0) * 1000)
+    log.info("Query answered in %dms (mode=%s, chunks=%d, confidence=%.3f)",
+             duration_ms, retrieval_mode, chunks_used, max_similarity,
+             extra={"query": query, "duration_ms": duration_ms})
+
+    payload: dict[str, Any] = {
         "answer_markdown": answer,
         "citations": citations,
+        "max_similarity": max_similarity,
+        "low_confidence": low_confidence,
+        "duration_ms": duration_ms,
         "debug_payload": {
             "embedding_preview": [float(x) for x in query_vec[:16]],
             "retrieved_chunks": [
@@ -1415,11 +1600,13 @@ def search_image_chunks(
 
 
 def check_ollama_status(endpoint: str = "http://127.0.0.1:11434", api_key: str = "") -> bool:
+    """Check if Ollama is reachable (Problem V)."""
     try:
-        headers = {}
+        session = _get_ollama_session()
+        headers: dict[str, str] = {}
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
-        r = requests.get(f"{endpoint}/api/tags", headers=headers, timeout=4)
+        r = session.get(f"{endpoint}/api/tags", headers=headers, timeout=4)
         return r.status_code == 200
     except Exception:
         return False
@@ -1427,10 +1614,11 @@ def check_ollama_status(endpoint: str = "http://127.0.0.1:11434", api_key: str =
 
 def check_ollama_model(endpoint: str = "http://127.0.0.1:11434", api_key: str = "", model_name: str = "") -> bool:
     try:
-        headers = {}
+        session = _get_ollama_session()
+        headers: dict[str, str] = {}
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
-        r = requests.get(f"{endpoint}/api/tags", headers=headers, timeout=4)
+        r = session.get(f"{endpoint}/api/tags", headers=headers, timeout=4)
         if r.status_code != 200:
             return False
         payload = r.json()
@@ -1441,6 +1629,57 @@ def check_ollama_model(endpoint: str = "http://127.0.0.1:11434", api_key: str = 
         return False
     except Exception:
         return False
+
+
+def get_ollama_status_message(endpoint: str = "http://127.0.0.1:11434", api_key: str = "") -> dict[str, Any]:
+    """Return a detailed Ollama status check with actionable messages (Problem V)."""
+    result: dict[str, Any] = {"running": False, "message": "", "download_url": "https://ollama.com/download"}
+    try:
+        session = _get_ollama_session()
+        headers: dict[str, str] = {}
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+        r = session.get(f"{endpoint}/api/tags", headers=headers, timeout=4)
+        if r.status_code == 200:
+            result["running"] = True
+            result["message"] = "Ollama is running and reachable."
+            models = r.json().get("models", [])
+            result["models"] = [m.get("name", str(m)) for m in models] if isinstance(models, list) else []
+        else:
+            result["message"] = f"Ollama responded with status {r.status_code}. Ensure it is properly configured."
+    except requests.exceptions.ConnectionError:
+        result["message"] = (
+            f"Ollama is not running on {endpoint}. "
+            "Please start it with `ollama serve` in a terminal, or download from https://ollama.com/download"
+        )
+    except Exception as e:
+        result["message"] = f"Cannot reach Ollama: {e}"
+    return result
+
+
+def get_autocomplete_suggestions(store_path: str, prefix: str, max_results: int = 8) -> list[str]:
+    """Return autocomplete suggestions from indexed document titles and metadata (Problem BB)."""
+    suggestions: list[str] = []
+    metadata_file = Path(store_path) / "metadata.json"
+    if not metadata_file.exists():
+        return suggestions
+    try:
+        raw = json.loads(metadata_file.read_text(encoding="utf-8"))
+        chunks = raw.get("chunks", raw) if isinstance(raw, dict) else raw
+        if not isinstance(chunks, list):
+            return suggestions
+        seen: set[str] = set()
+        needle = prefix.lower()
+        for item in chunks:
+            name = str(item.get("file_name", ""))
+            if name and needle in name.lower() and name not in seen:
+                seen.add(name)
+                suggestions.append(name)
+            if len(suggestions) >= max_results:
+                break
+    except Exception:
+        pass
+    return suggestions
 
 
 def _run_command(command: list[str]) -> tuple[bool, str]:

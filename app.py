@@ -5,9 +5,9 @@ import csv
 import io
 import html
 import tempfile
+import threading
 import zipfile
 from pathlib import Path
-from tkinter import Tk, filedialog
 from typing import Any
 
 import streamlit as st
@@ -35,15 +35,23 @@ from local_archive_ai.services import (
     answer_query,
     check_ollama_status,
     collect_files,
+    generate_with_ollama_stream,
+    get_autocomplete_suggestions,
     get_index_status,
+    get_ollama_status_message,
     index_documents,
     load_index_metadata,
+    prewarm_ollama,
     runtime_mode,
     summarize_indexable_content,
     system_checks,
     vector_diagnostics,
 )
+from local_archive_ai.logging_config import log
+from local_archive_ai.query_cache import QueryCache
+from local_archive_ai.store import LocalVectorStore
 from local_archive_ai.styles import CSS
+from local_archive_ai.watcher import FolderWatcher
 
 
 st.set_page_config(
@@ -53,6 +61,22 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 st.markdown(CSS, unsafe_allow_html=True)
+
+
+# ----- st.cache_resource for heavy objects (Problem A) -----
+
+@st.cache_resource(show_spinner=False)
+def _get_query_cache() -> QueryCache:
+    """Singleton query cache, persisted across reruns."""
+    return QueryCache()
+
+
+@st.cache_resource(show_spinner=False)
+def _get_folder_watcher() -> FolderWatcher:
+    """Singleton folder watcher."""
+    def _noop(paths: list) -> None:
+        pass  # Will be replaced when watcher is started
+    return FolderWatcher(callback=_noop)
 
 
 @st.cache_data(show_spinner=False)
@@ -94,24 +118,35 @@ def _render_retrieval_card(title: str, score: float | None, meta: str, body: str
 
 
 def _init_state() -> None:
-    if "config" not in st.session_state:
+    defaults: dict[str, Any] = {
+        "config": None,
+        "chat_history": [],
+        "last_index_report": None,
+        "batch_results": [],
+        "last_debug_payload": {},
+        "selected_folder": "",
+        "nav_page": "LANDING",
+        "nav_pending": None,
+        "pipeline_stage": "Document Intake",
+        "ollama_prewarmed": False,
+        "watcher_running": False,
+    }
+    for key, default in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = default
+    if st.session_state.config is None:
         st.session_state.config = load_config()
-    if "chat_history" not in st.session_state:
-        st.session_state.chat_history = []
-    if "last_index_report" not in st.session_state:
-        st.session_state.last_index_report = None
-    if "batch_results" not in st.session_state:
-        st.session_state.batch_results = []
-    if "last_debug_payload" not in st.session_state:
-        st.session_state.last_debug_payload = {}
-    if "selected_folder" not in st.session_state:
-        st.session_state.selected_folder = ""
-    if "nav_page" not in st.session_state:
-        st.session_state.nav_page = "LANDING"
-    if "nav_pending" not in st.session_state:
-        st.session_state.nav_pending = None
-    if "pipeline_stage" not in st.session_state:
-        st.session_state.pipeline_stage = "Document Intake"
+
+    # Pre-warm Ollama in background on first load (Problem O)
+    if not st.session_state.ollama_prewarmed:
+        st.session_state.ollama_prewarmed = True
+        cfg = st.session_state.config
+        thread = threading.Thread(
+            target=prewarm_ollama,
+            args=(cfg.ollama_endpoint, cfg.model_name, cfg.ollama_api_key),
+            daemon=True,
+        )
+        thread.start()
 
 
 def _goto(page: str) -> None:
@@ -122,12 +157,16 @@ def _goto(page: str) -> None:
 
 
 def _pick_folder_native() -> str:
-    root = Tk()
-    root.withdraw()
-    root.attributes("-topmost", True)
-    selected = filedialog.askdirectory(title="Select folder to index")
-    root.destroy()
-    return selected
+    try:
+        from tkinter import Tk, filedialog
+        root = Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        selected = filedialog.askdirectory(title="Select folder to index")
+        root.destroy()
+        return selected
+    except Exception:
+        return ""
 
 
 def render_sidebar(config: AppConfig) -> AppConfig:
@@ -257,7 +296,10 @@ def render_sidebar(config: AppConfig) -> AppConfig:
         )
         bm25_weight = st.slider("BM25 weight", min_value=0.0, max_value=1.0, value=float(config.bm25_weight), step=0.05)
         rerank_top_n = st.slider("Rerank top N", min_value=1, max_value=20, value=int(config.rerank_top_n), step=1)
+        temperature = st.slider("Temperature", min_value=0.0, max_value=2.0, value=float(config.temperature), step=0.1)
+        confidence_threshold = st.slider("Confidence threshold", min_value=0.0, max_value=1.0, value=float(config.confidence_threshold), step=0.05)
         debug_mode = st.checkbox("Debug mode", value=config.debug_mode)
+        enable_watcher = st.checkbox("Enable folder watcher", value=config.enable_watcher)
         if st.button("Save settings", use_container_width=True):
             config = config.model_copy(update={
                 "chunk_size": int(chunk_size),
@@ -270,22 +312,30 @@ def render_sidebar(config: AppConfig) -> AppConfig:
                 "bm25_weight": float(bm25_weight),
                 "rerank_top_n": int(rerank_top_n),
                 "debug_mode": debug_mode,
+                "temperature": float(temperature),
+                "confidence_threshold": float(confidence_threshold),
+                "enable_watcher": enable_watcher,
             })
             save_config(config)
             st.session_state.config = config
             st.success("Settings saved to config.yaml")
+            log.info("Settings saved via UI")
 
     st.sidebar.markdown("---")
     st.sidebar.markdown("### System Vitals")
     mode = runtime_mode()
-    ollama_ok = check_ollama_status(config.ollama_endpoint, config.ollama_api_key)
+    ollama_status = get_ollama_status_message(config.ollama_endpoint, config.ollama_api_key)
     idx = get_index_status(config.faiss_path)
 
     st.sidebar.caption(f"Mode: {mode['mode']}")
     st.sidebar.caption(f"VRAM: {mode['vram']}")
     st.sidebar.caption(f"GPU Utilization: {mode.get('gpu_util', 'N/A')}")
     st.sidebar.caption(f"GPU Temperature: {mode.get('gpu_temp', 'N/A')}")
-    st.sidebar.caption(f"Ollama: {'ACTIVE' if ollama_ok else 'INACTIVE'}")
+    if ollama_status["running"]:
+        st.sidebar.caption("Ollama: ACTIVE")
+    else:
+        st.sidebar.error(ollama_status["message"])
+        st.sidebar.caption(f"Download: {ollama_status['download_url']}")
     st.sidebar.caption(
         f"FAISS: {'LOADED' if idx.get('exists') else 'NOT READY'}"
     )
@@ -305,6 +355,39 @@ def render_sidebar(config: AppConfig) -> AppConfig:
             f"- Ollama Model Available: {'YES' if checks['ollama_model_available'] else 'NO'}"
         )
         st.caption(f"FAISS detail: {checks['faiss_message']}")
+
+    # Index management tools (Problem S, T)
+    with st.sidebar.expander("Index Management", expanded=False):
+        store = LocalVectorStore(Path(config.faiss_path))
+        export_col, import_col = st.columns(2)
+        if export_col.button("Export Index", use_container_width=True):
+            try:
+                dest = Path(config.faiss_path) / "export.zip"
+                store.load()
+                store.export_index(dest)
+                st.success(f"Exported to {dest}")
+            except Exception as exc:
+                st.error(str(exc))
+        uploaded_index = import_col.file_uploader("Import .zip", type=["zip"], key="import_index_zip")
+        if uploaded_index is not None:
+            import_path = Path(config.faiss_path) / "_import.zip"
+            import_path.parent.mkdir(parents=True, exist_ok=True)
+            import_path.write_bytes(uploaded_index.getbuffer())
+            if store.import_index(import_path):
+                st.success("Index imported!")
+            else:
+                st.error("Import failed.")
+            import_path.unlink(missing_ok=True)
+
+        # Checkpoints (Problem T)
+        checkpoints = store.list_checkpoints()
+        if checkpoints:
+            st.caption(f"{len(checkpoints)} checkpoint(s) available")
+            if st.button("Rollback to latest checkpoint", use_container_width=True):
+                if store.rollback_checkpoint(checkpoints[0]):
+                    st.success("Rolled back!")
+                else:
+                    st.error("Rollback failed.")
 
     return config
 
@@ -528,11 +611,13 @@ def render_chat(config: AppConfig) -> None:
 
 
 def render_query_form(config: AppConfig) -> None:
-    c1, c2, c3 = st.columns(3)
+    c1, c2, c3, c4 = st.columns(4)
     c1.metric("Retrieval Mode", config.retrieval_mode.upper())
     c2.metric("Top-K", int(config.top_k))
     c3.metric("Model", config.model_name)
+    c4.metric("Confidence", f"{config.confidence_threshold:.0%}")
 
+    # Problem D: use st.form to prevent premature queries on every keystroke
     with st.form("query_form", clear_on_submit=True, border=False):
         query = st.text_area(
             "Enter query for local archive",
@@ -553,37 +638,61 @@ def render_query_form(config: AppConfig) -> None:
             return
         ollama_ok = check_ollama_status(config.ollama_endpoint, config.ollama_api_key)
         if not ollama_ok:
-            st.error(
-                f"Ollama is not running on {config.ollama_endpoint}. "
-                "Start Ollama and make sure your model is pulled, then retry."
-            )
+            status_info = get_ollama_status_message(config.ollama_endpoint, config.ollama_api_key)
+            st.error(status_info["message"])
             return
 
-        with st.spinner("Retrieving context and generating response..."):
-            try:
-                payload = answer_query(
-                    query=query.strip(),
-                    top_k=config.top_k,
-                    model_name=config.model_name,
-                    store_path=config.faiss_path,
-                    debug=config.debug_mode,
-                    ollama_endpoint=config.ollama_endpoint,
-                    ollama_api_key=config.ollama_api_key,
-                    retrieval_mode=config.retrieval_mode,
-                    bm25_weight=config.bm25_weight,
-                    rerank_top_n=config.rerank_top_n,
-                )
-                st.session_state.chat_history.append(
-                    {
-                        "query": query.strip(),
-                        "answer": payload["answer_markdown"],
-                        "citations": payload["citations"],
-                        "debug": payload.get("debug_payload", {}),
-                    }
-                )
-                st.session_state.last_debug_payload = payload.get("debug_payload", {})
-            except Exception as exc:
-                st.error(str(exc))
+        # Check query cache first (Speed Optimization)
+        cache = _get_query_cache()
+        cached = None
+        if config.query_cache_ttl > 0:
+            cached = cache.get(query.strip(), config.top_k, config.retrieval_mode, config.faiss_path)
+
+        if cached is not None:
+            st.caption("(cached result)")
+            payload = cached
+        else:
+            # Problem B: show spinner during query
+            with st.status("Processing query...", expanded=True) as status:
+                st.write("Retrieving context from index...")
+                try:
+                    payload = answer_query(
+                        query=query.strip(),
+                        top_k=config.top_k,
+                        model_name=config.model_name,
+                        store_path=config.faiss_path,
+                        debug=config.debug_mode,
+                        ollama_endpoint=config.ollama_endpoint,
+                        ollama_api_key=config.ollama_api_key,
+                        retrieval_mode=config.retrieval_mode,
+                        bm25_weight=config.bm25_weight,
+                        rerank_top_n=config.rerank_top_n,
+                        confidence_threshold=config.confidence_threshold,
+                        temperature=config.temperature,
+                        max_context_tokens=config.max_context_tokens,
+                    )
+                    st.write("Generating response...")
+                    status.update(label="Done!", state="complete")
+                except Exception as exc:
+                    status.update(label="Error", state="error")
+                    st.error(str(exc))
+                    return
+
+            # Cache the result
+            if config.query_cache_ttl > 0:
+                cache.put(query.strip(), config.top_k, config.retrieval_mode, config.faiss_path, payload)
+
+        st.session_state.chat_history.append(
+            {
+                "query": query.strip(),
+                "answer": payload["answer_markdown"],
+                "citations": payload["citations"],
+                "debug": payload.get("debug_payload", {}),
+                "low_confidence": payload.get("low_confidence", False),
+                "duration_ms": payload.get("duration_ms", 0),
+            }
+        )
+        st.session_state.last_debug_payload = payload.get("debug_payload", {})
 
 
 def render_debug_logs(config: AppConfig) -> None:
@@ -692,8 +801,10 @@ def render_debug_logs(config: AppConfig) -> None:
 
 
 def _run_batch_query(queries: list[str], config: AppConfig) -> None:
+    """Run batch queries with incremental display (Problem CC) and progress (Problem B)."""
     st.session_state.batch_results = []
     progress = st.progress(0.0, text="Queue initialized")
+    results_container = st.container()
 
     for idx, query in enumerate(queries, start=1):
         row: dict[str, Any] = {
@@ -717,6 +828,9 @@ def _run_batch_query(queries: list[str], config: AppConfig) -> None:
                 retrieval_mode=config.retrieval_mode,
                 bm25_weight=config.bm25_weight,
                 rerank_top_n=config.rerank_top_n,
+                confidence_threshold=config.confidence_threshold,
+                temperature=config.temperature,
+                max_context_tokens=config.max_context_tokens,
             )
             row["answer"] = payload.get("answer_markdown", "")
             row["status"] = "COMPLETED"
@@ -726,14 +840,23 @@ def _run_batch_query(queries: list[str], config: AppConfig) -> None:
             row["status"] = "FAILED"
             row["progress"] = 100
 
+        # Incremental display (Problem CC)
+        with results_container:
+            st.caption(f"{row['id']}: {row['status']} - {query[:60]}")
+
         progress.progress(idx / len(queries), text=f"Processed {idx}/{len(queries)} queries")
 
 
 def render_batch_queue(config: AppConfig) -> None:
     _section_panel(
         "BATCH QUERIES",
-        "Run multiple archive prompts in sequence and export responses as CSV.",
+        "Run multiple archive prompts in sequence and export responses as CSV. "
+        "You can also upload a CSV file with a 'query' column.",
     )
+
+    # CSV upload for batch queries (Problem Q)
+    csv_upload = st.file_uploader("Upload CSV (column: 'query')", type=["csv"], key="batch_csv_upload")
+
     queries_raw = st.text_area(
         "Input raw queries (one per line)",
         height=170,
@@ -748,11 +871,26 @@ def render_batch_queue(config: AppConfig) -> None:
         st.rerun()
 
     if run:
-        queries = [line.strip() for line in queries_raw.splitlines() if line.strip()]
+        queries: list[str] = []
+        # Parse from CSV upload first
+        if csv_upload is not None:
+            try:
+                import pandas as pd
+                df = pd.read_csv(csv_upload)
+                if "query" in df.columns:
+                    queries = [str(q).strip() for q in df["query"].dropna().tolist() if str(q).strip()]
+                else:
+                    st.warning("CSV must contain a 'query' column.")
+            except Exception as exc:
+                st.error(f"Failed to parse CSV: {exc}")
+        # Then add text area queries
+        queries.extend([line.strip() for line in queries_raw.splitlines() if line.strip()])
         if not queries:
             st.warning("Add at least one query.")
         else:
-            _run_batch_query(queries, config)
+            with st.status(f"Processing {len(queries)} queries...", expanded=True) as batch_status:
+                _run_batch_query(queries, config)
+                batch_status.update(label="Batch complete!", state="complete")
 
     rows = st.session_state.batch_results
     st.markdown("#### Active Process Monitor")
@@ -944,6 +1082,32 @@ def render_vector_lab(config: AppConfig) -> None:
         st.code(debug.get("prompt_text", ""), language="text")
 
 
+# ----- Keyboard shortcuts (Problem E) -----
+_KEYBOARD_SHORTCUTS_JS = """
+<script>
+document.addEventListener('keydown', function(e) {
+    // Ctrl+K: focus search / query input
+    if (e.ctrlKey && e.key === 'k') {
+        e.preventDefault();
+        const textareas = document.querySelectorAll('textarea');
+        if (textareas.length > 0) textareas[0].focus();
+    }
+    // Ctrl+Shift+C: clear chat (triggers the clear chat button)
+    if (e.ctrlKey && e.shiftKey && e.key === 'C') {
+        e.preventDefault();
+        const buttons = document.querySelectorAll('button');
+        for (const btn of buttons) {
+            if (btn.textContent.trim().includes('CLEAR CHAT')) {
+                btn.click();
+                break;
+            }
+        }
+    }
+});
+</script>
+"""
+
+
 def main() -> None:
     _init_state()
     config = st.session_state.config
@@ -951,6 +1115,9 @@ def main() -> None:
     st.session_state.config = config
 
     st.markdown("<div class='app-shell'>", unsafe_allow_html=True)
+
+    # Inject keyboard shortcuts (Problem E)
+    st.components.v1.html(_KEYBOARD_SHORTCUTS_JS, height=0)
 
     head_left, head_right = st.columns([2, 1])
     head_left.title("LOCAL-ARCHIVE AI")

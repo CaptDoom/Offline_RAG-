@@ -20,3 +20,6 @@ plotly
 pillow
 pytesseract
 tqdm
+watchdog
+opencv-python-headless
+pandas
