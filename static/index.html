@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LOCAL-ARCHIVE AI</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <div class="app-container">
+        <!-- Sidebar -->
+        <aside class="sidebar">
+            <div class="sidebar-header">
+                <div class="logo-box">
+                    <svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"></path><path d="M22 6l-10 7L2 6"></path></svg>
+                </div>
+                <div class="logo-text">
+                    <h2>LOCAL-ARCHIVE</h2>
+                    <h2>AI</h2>
+                    <span>V1.0.0-STABLE</span>
+                </div>
+            </div>
+
+            <nav class="sidebar-nav">
+                <a href="#" class="nav-item active" data-target="view-chat">
+                    <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2v10z"></path></svg>
+                    Chat
+                </a>
+                <a href="#" class="nav-item" data-target="view-debug">
+                    <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 20v-6M6 20V10M18 20V4"></path></svg>
+                    Debug
+                </a>
+                <a href="#" class="nav-item" data-target="view-batch">
+                    <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"></path><polyline points="3.27 6.96 12 12.01 20.73 6.96"></polyline><line x1="12" y1="22.08" x2="12" y2="12"></line></svg>
+                    Batch
+                </a>
+            </nav>
+
+            <div class="indexing-engine-panel">
+                 <div class="panel-title">INDEXING ENGINE</div>
+                 <div class="input-row">
+                    <input type="text" id="folder-path" value="" placeholder="Path to local docs">
+                    <button id="browse-btn">BROWSE</button>
+                 </div>
+                 <div class="status-row">
+                    <span>Files found: <strong id="files-found">0</strong></span>
+                    <span class="status-ready" id="sidebar-index-ready">READY</span>
+                 </div>
+                 <button class="primary-btn" id="index-files-btn">INDEX_FILES</button>
+            </div>
+
+            <div class="sidebar-footer">
+                <a href="#" class="footer-item"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg> Settings</a>
+                <a href="#" class="footer-item"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"></polyline></svg> System Status</a>
+            </div>
+        </aside>
+
+        <!-- Main Content -->
+        <main class="main-content">
+            <!-- Topbar -->
+            <header class="topbar">
+                <div class="topbar-left">
+                    <a href="#" class="top-tab active" data-target="view-chat">CHAT_ENGINE</a>
+                    <a href="#" class="top-tab" data-target="view-debug">DEBUG_LOGS</a>
+                    <a href="#" class="top-tab" data-target="view-batch">BATCH_QUEUE</a>
+                </div>
+                <div class="topbar-right">
+                    <div class="system-ready-pill" id="system-readiness">
+                        <svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor" stroke="none"><circle cx="12" cy="12" r="8"></circle></svg> SYSTEM_READY
+                    </div>
+                    <div class="runtime-pill" id="python-runtime">PYTHON</div>
+                </div>
+            </header>
+
+            <div class="view-container">
+                <!-- VIEW: CHAT -->
+                <div id="view-chat" class="view active">
+                    <!-- Index Active Banner -->
+                    <div class="archive-banner" id="index-banner">
+                        <div class="banner-content">
+                            <div class="banner-icon"><svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="#fff" stroke-width="3"><polyline points="20 6 9 17 4 12"></polyline></svg></div>
+                            <div>
+                                <h2>INDEX ACTIVE</h2>
+                                <p class="mono-stat" id="dataset-stats">DATASET: 0 HIGH-FIDELITY DOCUMENTS PARSED</p>
+                            </div>
+                        </div>
+                        <div class="banner-actions">
+                            <button class="ghost-btn">CLEAR</button>
+                            <button class="solid-btn-white">RE-INDEX</button>
+                            <div class="total-indexed">
+                                <span id="total-indexed-count">0</span>
+                                <small>TOTAL INDEXED</small>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="chat-history" id="chat-history">
+                        <!-- Chat messages will be injected here -->
+                    </div>
+
+                    <div class="chat-input-container">
+                        <input type="text" id="chat-input" placeholder="Enter query for local archive...">
+                        <button class="primary-btn square" id="chat-send-btn">SEND <span>&#10148;</span></button>
+                        <button class="secondary-btn" id="chat-clear-btn">CLEAR CHAT</button>
+                    </div>
+                </div>
+
+                <!-- VIEW: DEBUG -->
+                <div id="view-debug" class="view">
+                    <div class="debug-header">
+                        <div class="debug-title">
+                            <div class="debug-icon"><svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="#fff" stroke-width="2"><circle cx="12" cy="12" r="10"></circle><path d="M12 8v4l3 3"></path></svg></div>
+                            <div>
+                                <h2>DEBUG MODE</h2>
+                                <p class="mono-stat">SESSION_ID: ARCH-772-DEBUG</p>
+                            </div>
+                        </div>
+                        <div class="debug-actions">
+                            <button class="secondary-btn">COPY DEBUG INFO</button>
+                            <button class="primary-btn">EXPORT SESSION LOG</button>
+                        </div>
+                    </div>
+
+                    <div class="debug-panel">
+                        <div class="panel-header mono-stat">[ ] QUERY EMBEDDING VISUALIZATION <span class="badge">DIMENSIONS: 1536</span></div>
+                        <div class="embed-array" id="debug-embedding">[ 0.0142, -0.0089, 0.0456, 0.1102, -0.0673, 0.0234, -0.0911, ... ]</div>
+                    </div>
+
+                    <div class="retrieval-header">
+                        RETRIEVED CHUNKS (K=<span id="debug-k">4</span>)
+                        <span class="latency" id="debug-latency">LATENCY: 142ms</span>
+                    </div>
+
+                    <div class="chunks-grid" id="debug-chunks-grid">
+                        <!-- Chunks injected here -->
+                    </div>
+
+                    <div class="prompt-panel">
+                        <div class="panel-header">FULL PROMPT SENT TO LLM</div>
+                        <pre id="debug-prompt">[SYSTEM]
+You are a highly specialized AI assistant focused on technical documentation retrieval...</pre>
+                    </div>
+                </div>
+
+                <!-- VIEW: BATCH -->
+                <div id="view-batch" class="view">
+                    <div class="batch-header">
+                        <h2>BATCH QUERIES</h2>
+                        <span class="mono-stat">EXECUTION_ENVIRONMENT: LOCAL_VAULT_BETA</span>
+                    </div>
+
+                    <div class="batch-grid">
+                        <div class="batch-left">
+                            <textarea id="batch-queries" class="mono-textarea" placeholder="INPUT RAW QUERIES (ONE PER LINE)
+
+1. Summarize documents in /archive/internal/reports
+2. Extract all expiration dates from service_contracts.pdf"></textarea>
+                            <div class="batch-actions">
+                                <div class="queue-depth">
+                                    <small>QUEUE_DEPTH:</small><br>
+                                    <strong id="queue-depth">0</strong>
+                                </div>
+                                <button class="secondary-btn" id="batch-clear-btn">CLEAR_BUFFER</button>
+                                <button class="primary-btn" id="batch-run-btn">RUN BATCH</button>
+                            </div>
+                            
+                            <div class="active-process">
+                                <h3>ACTIVE PROCESS MONITOR <span class="live-dot"></span></h3>
+                                <table class="process-table">
+                                    <thead>
+                                        <tr>
+                                            <th>ID</th>
+                                            <th>QUERY_DIRECTIVE</th>
+                                            <th>STATUS</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody id="batch-tbody">
+                                        <!-- results loaded here -->
+                                    </tbody>
+                                </table>
+                            </div>
+                        </div>
+                        <div class="batch-right">
+                            <div class="system-ready-panel">
+                                <h3>SYSTEM READY</h3>
+                                <p>Archive integrity verified. All local models are loaded and ready for batch processing.</p>
+                                <hr>
+                                <div class="sys-item"><span>ESTIMATED_TIME</span> <strong id="est-time">~0.0s</strong></div>
+                            </div>
+                            <button class="secondary-btn download-btn">DOWNLOAD RESULTS AS CSV</button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </main>
+    </div>
+    
+    <script src="/static/app.js"></script>
+</body>
+</html>

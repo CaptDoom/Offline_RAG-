@@ -1,0 +1,11 @@
+chunk_size: 500
+top_k: 4
+model_name: llama3.2:1b
+faiss_path: data/faiss_index
+debug_mode: false
+ollama_endpoint: http://127.0.0.1:11434
+ollama_api_key: ""
+ocr_engine: tesseract
+bm25_weight: 0.4
+rerank_top_n: 5
+retrieval_mode: vector
