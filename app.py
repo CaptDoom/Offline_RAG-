@@ -50,6 +50,9 @@ from local_archive_ai.services import (
 from local_archive_ai.logging_config import log
 from local_archive_ai.query_cache import QueryCache
 from local_archive_ai.store import LocalVectorStore
+from local_archive_ai.chat_engine import ChatEngine
+from local_archive_ai.batch_processor import BatchProcessor
+from local_archive_ai.multi_format_loader import MultiFormatLoader
 from local_archive_ai.styles import CSS
 from local_archive_ai.watcher import FolderWatcher
 
@@ -69,6 +72,25 @@ st.markdown(CSS, unsafe_allow_html=True)
 def _get_query_cache() -> QueryCache:
     """Singleton query cache, persisted across reruns."""
     return QueryCache()
+
+
+def _get_chat_engine(config: AppConfig) -> ChatEngine:
+    """Get or create ChatEngine instance stored in session state."""
+    if "chat_engine" not in st.session_state or st.session_state.chat_engine is None:
+        st.session_state.chat_engine = ChatEngine(
+            store_path=config.faiss_path,
+            model_name=config.model_name,
+            ollama_endpoint=config.ollama_endpoint,
+            ollama_api_key=config.ollama_api_key,
+            top_k=config.top_k,
+            retrieval_mode=config.retrieval_mode,
+            bm25_weight=config.bm25_weight,
+            rerank_top_n=config.rerank_top_n,
+            confidence_threshold=config.confidence_threshold,
+            temperature=config.temperature,
+            max_context_tokens=config.max_context_tokens,
+        )
+    return st.session_state.chat_engine
 
 
 @st.cache_resource(show_spinner=False)
@@ -130,6 +152,8 @@ def _init_state() -> None:
         "pipeline_stage": "Document Intake",
         "ollama_prewarmed": False,
         "watcher_running": False,
+        "chat_engine": None,
+        "streaming_response": "",
     }
     for key, default in defaults.items():
         if key not in st.session_state:
@@ -617,6 +641,12 @@ def render_query_form(config: AppConfig) -> None:
     c3.metric("Model", config.model_name)
     c4.metric("Confidence", f"{config.confidence_threshold:.0%}")
 
+    # Show conversation memory status
+    engine = _get_chat_engine(config)
+    memory = engine.get_memory()
+    if memory:
+        st.caption(f"Conversation memory: {len(memory)} turn(s) (last 5 kept as context)")
+
     # Problem D: use st.form to prevent premature queries on every keystroke
     with st.form("query_form", clear_on_submit=True, border=False):
         query = st.text_area(
@@ -624,15 +654,18 @@ def render_query_form(config: AppConfig) -> None:
             height=84,
             placeholder="What are the key findings about compiler optimization?",
         )
-        c1, c2 = st.columns([2, 1])
+        c1, c2, c3 = st.columns([2, 1, 1])
         submitted = c1.form_submit_button("SEND  >", use_container_width=True)
-        clear = c2.form_submit_button("CLEAR CHAT", use_container_width=True)
+        stream_mode = c2.form_submit_button("STREAM  >>>", use_container_width=True)
+        clear = c3.form_submit_button("CLEAR CHAT", use_container_width=True)
 
     if clear:
         st.session_state.chat_history = []
+        engine.clear_memory()
+        st.session_state.chat_engine = None  # Reset engine
         return
 
-    if submitted:
+    if submitted or stream_mode:
         if not query.strip():
             st.warning("Please enter a query.")
             return
@@ -642,57 +675,91 @@ def render_query_form(config: AppConfig) -> None:
             st.error(status_info["message"])
             return
 
-        # Check query cache first (Speed Optimization)
-        cache = _get_query_cache()
-        cached = None
-        if config.query_cache_ttl > 0:
-            cached = cache.get(query.strip(), config.top_k, config.retrieval_mode, config.faiss_path)
+        if stream_mode:
+            # Streaming mode using ChatEngine
+            st.markdown(f"<div class='user-bubble'>{query.strip()}</div>", unsafe_allow_html=True)
+            response_container = st.empty()
+            full_response = ""
+            try:
+                for token in engine.query_stream(query.strip()):
+                    full_response += token
+                    response_container.markdown(full_response)
+            except Exception as exc:
+                st.error(str(exc))
+                return
 
-        if cached is not None:
-            st.caption("(cached result)")
-            payload = cached
+            # Get citations from last turn
+            last = engine.last_turn()
+            citations = last.citations if last else []
+
+            st.session_state.chat_history.append(
+                {
+                    "query": query.strip(),
+                    "answer": full_response,
+                    "citations": citations,
+                    "debug": {},
+                    "low_confidence": last.low_confidence if last else False,
+                    "duration_ms": 0,
+                }
+            )
         else:
-            # Problem B: show spinner during query
-            with st.status("Processing query...", expanded=True) as status:
-                st.write("Retrieving context from index...")
-                try:
-                    payload = answer_query(
-                        query=query.strip(),
-                        top_k=config.top_k,
-                        model_name=config.model_name,
-                        store_path=config.faiss_path,
-                        debug=config.debug_mode,
-                        ollama_endpoint=config.ollama_endpoint,
-                        ollama_api_key=config.ollama_api_key,
-                        retrieval_mode=config.retrieval_mode,
-                        bm25_weight=config.bm25_weight,
-                        rerank_top_n=config.rerank_top_n,
-                        confidence_threshold=config.confidence_threshold,
-                        temperature=config.temperature,
-                        max_context_tokens=config.max_context_tokens,
-                    )
-                    st.write("Generating response...")
-                    status.update(label="Done!", state="complete")
-                except Exception as exc:
-                    status.update(label="Error", state="error")
-                    st.error(str(exc))
-                    return
-
-            # Cache the result
+            # Non-streaming mode using ChatEngine with cache support
+            cache = _get_query_cache()
+            cached = None
             if config.query_cache_ttl > 0:
-                cache.put(query.strip(), config.top_k, config.retrieval_mode, config.faiss_path, payload)
+                cached = cache.get(query.strip(), config.top_k, config.retrieval_mode, config.faiss_path)
 
-        st.session_state.chat_history.append(
-            {
-                "query": query.strip(),
-                "answer": payload["answer_markdown"],
-                "citations": payload["citations"],
-                "debug": payload.get("debug_payload", {}),
-                "low_confidence": payload.get("low_confidence", False),
-                "duration_ms": payload.get("duration_ms", 0),
-            }
-        )
-        st.session_state.last_debug_payload = payload.get("debug_payload", {})
+            if cached is not None:
+                st.caption("(cached result)")
+                payload = cached
+                st.session_state.chat_history.append(
+                    {
+                        "query": query.strip(),
+                        "answer": payload["answer_markdown"],
+                        "citations": payload["citations"],
+                        "debug": payload.get("debug_payload", {}),
+                        "low_confidence": payload.get("low_confidence", False),
+                        "duration_ms": payload.get("duration_ms", 0),
+                    }
+                )
+            else:
+                # Use ChatEngine for query (includes memory context)
+                with st.status("Processing query...", expanded=True) as status:
+                    st.write("Retrieving context from index...")
+                    try:
+                        response = engine.query(query.strip())
+                        st.write("Generating response...")
+                        status.update(label=f"Done! ({response.duration_ms}ms)", state="complete")
+                    except Exception as exc:
+                        status.update(label="Error", state="error")
+                        st.error(str(exc))
+                        return
+
+                # Build payload for cache and history
+                payload = {
+                    "answer_markdown": response.answer,
+                    "citations": response.citations,
+                    "debug_payload": response.debug_payload,
+                    "low_confidence": response.low_confidence,
+                    "duration_ms": response.duration_ms,
+                    "max_similarity": response.max_similarity,
+                }
+
+                # Cache the result
+                if config.query_cache_ttl > 0:
+                    cache.put(query.strip(), config.top_k, config.retrieval_mode, config.faiss_path, payload)
+
+                st.session_state.chat_history.append(
+                    {
+                        "query": query.strip(),
+                        "answer": response.answer,
+                        "citations": response.citations,
+                        "debug": response.debug_payload,
+                        "low_confidence": response.low_confidence,
+                        "duration_ms": response.duration_ms,
+                    }
+                )
+                st.session_state.last_debug_payload = response.debug_payload
 
 
 def render_debug_logs(config: AppConfig) -> None:
