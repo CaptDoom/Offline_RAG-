@@ -170,11 +170,19 @@ def _pick_folder_native() -> str:
 
 
 def render_sidebar(config: AppConfig) -> AppConfig:
-    st.sidebar.markdown("## LOCAL-ARCHIVE AI")
-    st.sidebar.caption("Offline RAG Dashboard")
-    st.sidebar.markdown("---")
+    st.sidebar.markdown(
+        "<div class='sidebar-brand'>"
+        "<div class='sidebar-brand-icon'>&#x1F512;</div>"
+        "<div><div class='sidebar-brand-text'>Local-Archive AI</div>"
+        "<div class='sidebar-version'>V1.0.0-STABLE</div></div>"
+        "</div>",
+        unsafe_allow_html=True,
+    )
 
-    st.sidebar.markdown("### Indexing Engine")
+    st.sidebar.markdown(
+        "<div class='sidebar-section-label'>INDEXING ENGINE</div>",
+        unsafe_allow_html=True,
+    )
     pick_col, clear_col = st.sidebar.columns([2, 1])
     if pick_col.button("BROWSE_FOLDER", use_container_width=True):
         selected = _pick_folder_native()
@@ -268,6 +276,10 @@ def render_sidebar(config: AppConfig) -> AppConfig:
     if right.button("RE-INDEX", use_container_width=True):
         st.rerun()
 
+    st.sidebar.markdown(
+        "<div class='sidebar-section-label'>GLOBAL SETTINGS</div>",
+        unsafe_allow_html=True,
+    )
     with st.sidebar.expander("Settings", expanded=False):
         chunk_size = st.slider(
             "Chunk size (tokens)",
@@ -321,24 +333,23 @@ def render_sidebar(config: AppConfig) -> AppConfig:
             st.success("Settings saved to config.yaml")
             log.info("Settings saved via UI")
 
-    st.sidebar.markdown("---")
-    st.sidebar.markdown("### System Vitals")
     mode = runtime_mode()
     ollama_status = get_ollama_status_message(config.ollama_endpoint, config.ollama_api_key)
     idx = get_index_status(config.faiss_path)
-
-    st.sidebar.caption(f"Mode: {mode['mode']}")
-    st.sidebar.caption(f"VRAM: {mode['vram']}")
-    st.sidebar.caption(f"GPU Utilization: {mode.get('gpu_util', 'N/A')}")
-    st.sidebar.caption(f"GPU Temperature: {mode.get('gpu_temp', 'N/A')}")
-    if ollama_status["running"]:
-        st.sidebar.caption("Ollama: ACTIVE")
-    else:
+    _online = ollama_status["running"]
+    st.sidebar.markdown(
+        "<div class='sidebar-footer'>"
+        f"<div class='sidebar-status'><span class='sidebar-status-dot{'' if _online else ' offline'}'></span>"
+        f"<span class='sidebar-status-label'>{'SYSTEM_STATUS: READY' if _online else 'SYSTEM_STATUS: OFFLINE'}</span></div>"
+        f"<div class='sidebar-stat-row'><span>GPU VRAM</span><span>{mode['vram']}</span></div>"
+        f"<div class='sidebar-stat-row'><span>Mode</span><span>{mode['mode']}</span></div>"
+        f"<div class='sidebar-stat-row'><span>FAISS</span><span>{'LOADED' if idx.get('exists') else 'NOT READY'}</span></div>"
+        "</div>",
+        unsafe_allow_html=True,
+    )
+    if not _online:
         st.sidebar.error(ollama_status["message"])
         st.sidebar.caption(f"Download: {ollama_status['download_url']}")
-    st.sidebar.caption(
-        f"FAISS: {'LOADED' if idx.get('exists') else 'NOT READY'}"
-    )
 
     with st.sidebar.expander("System Check", expanded=False):
         checks = system_checks(
@@ -400,10 +411,15 @@ def render_status_card(config: AppConfig) -> dict[str, Any]:
                 "<div class='archive-banner'>"
                 "<div style='display:flex;justify-content:space-between;gap:1rem;align-items:center;'>"
                 "<div>"
-                "<h3 style='margin:0;'>INDEX ACTIVE</h3>"
-                f"<div class='mono'>Dataset: {idx['file_count']} documents | {idx['chunk_count']} chunks parsed</div>"
+                "<h3 style='margin:0;font-family:Space Grotesk,sans-serif;letter-spacing:-0.02em;'"
+                " class='headline'>INDEX ACTIVE</h3>"
+                f"<div class='mono' style='font-size:0.75rem;opacity:0.8;letter-spacing:0.06em;'>"
+                f"DATASET: {idx['file_count']} HIGH-FIDELITY DOCUMENTS PARSED</div>"
                 "</div>"
-                f"<div style='font-size:2rem;font-weight:700;'>{idx['chunk_count']}</div>"
+                f"<div style='text-align:center;'>"
+                f"<div style='font-family:Space Grotesk,sans-serif;font-size:2.5rem;font-weight:700;'>{idx['chunk_count']}</div>"
+                f"<div class='mono' style='font-size:0.625rem;opacity:0.6;letter-spacing:0.1em;'>TOTAL INDEXED</div>"
+                "</div>"
                 "</div>"
                 "</div>"
             ),
@@ -413,8 +429,8 @@ def render_status_card(config: AppConfig) -> dict[str, Any]:
         st.markdown(
             (
                 "<div class='archive-banner warning'>"
-                "<h3 style='margin:0;'>NO INDEX FOUND</h3>"
-                "<div class='mono'>Use the sidebar indexing workflow to initialize local retrieval.</div>"
+                "<h3 style='margin:0;font-family:Space Grotesk,sans-serif;' class='headline'>NO INDEX FOUND</h3>"
+                "<div class='mono' style='font-size:0.75rem;opacity:0.8;'>Use the sidebar indexing workflow to initialize local retrieval.</div>"
                 "</div>"
             ),
             unsafe_allow_html=True,
@@ -434,8 +450,8 @@ def render_landing_page(config: AppConfig) -> None:
     st.markdown(
         (
             "<div class='landing-hero'>"
-            "<div class='metric-head'>LOCAL-FIRST RAG PLATFORM</div>"
-            "<h1>Build, Search, and Debug your Private Knowledge Pipeline</h1>"
+            "<div class='mono' style='font-size:0.625rem;opacity:0.6;letter-spacing:0.1em;margin-bottom:0.5rem;'>LOCAL-FIRST RAG PLATFORM</div>"
+            "<h1 style='font-family:Space Grotesk,sans-serif;'>Build, Search, and Debug your Private Knowledge Pipeline</h1>"
             "<p>Index local documents, retrieve context with semantic search, and inspect the full RAG flow in real time.</p>"
             "</div>"
         ),
@@ -591,10 +607,33 @@ def render_chat(config: AppConfig) -> None:
     visible_history = st.session_state.chat_history[-max_messages:]
 
     for item in visible_history:
-        st.markdown(f"<div class='user-bubble'>{item['query']}</div>", unsafe_allow_html=True)
-        safe_answer = html.escape(str(item["answer"])).replace("\n", "<br/>")
         st.markdown(
-            f"<div class='assistant-bubble'>{safe_answer}</div>",
+            f"<div class='user-bubble'>"
+            f"<div style='font-size:0.875rem;font-weight:500;color:var(--primary);'>{html.escape(item['query'])}</div>"
+            f"<div class='mono' style='font-size:0.625rem;color:var(--outline);margin-top:0.5rem;'>USER</div>"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+        safe_answer = html.escape(str(item["answer"])).replace("\n", "<br/>")
+        _conf = item.get('debug', {}).get('confidence', '')
+        _conf_html = (
+            f"<div style='position:absolute;top:-0.5rem;right:-0.5rem;background:var(--on-tertiary-container);"
+            f"color:white;padding:0.125rem 0.375rem;font-family:monospace;font-size:0.5625rem;'>"
+            f"CONFIDENCE: {_conf:.3f}</div>"
+        ) if isinstance(_conf, (int, float)) and _conf > 0 else ''
+        _low = item.get('low_confidence', False)
+        _low_html = (
+            "<div style='margin-top:0.5rem;padding:0.375rem 0.5rem;background:var(--error-container);"
+            "color:var(--error);font-family:monospace;font-size:0.6875rem;font-weight:700;'>"
+            "LOW CONFIDENCE — Documents may not clearly answer this query</div>"
+        ) if _low else ''
+        st.markdown(
+            f"<div class='assistant-bubble' style='position:relative;'>"
+            f"{_conf_html}"
+            f"<div style='line-height:1.6;font-size:0.875rem;'>{safe_answer}</div>"
+            f"{_low_html}"
+            f"<div class='mono' style='font-size:0.625rem;opacity:0.5;margin-top:0.5rem;'>ASSISTANT_ENGINE</div>"
+            f"</div>",
             unsafe_allow_html=True,
         )
         with st.expander(f"Retrieved Sources ({len(item.get('citations', []))})", expanded=False):
@@ -1119,11 +1158,14 @@ def main() -> None:
     # Inject keyboard shortcuts (Problem E)
     st.components.v1.html(_KEYBOARD_SHORTCUTS_JS, height=0)
 
-    head_left, head_right = st.columns([2, 1])
-    head_left.title("LOCAL-ARCHIVE AI")
-    head_right.markdown(
-        "<div style='text-align:right; padding-top:0.8rem;'>"
-        "<span class='system-pill'>SYSTEM_READY</span></div>",
+    ollama_ok = check_ollama_status(config.ollama_endpoint, config.ollama_api_key)
+    _pill_cls = 'system-pill' if ollama_ok else 'system-pill offline'
+    _pill_txt = 'SYSTEM_READY' if ollama_ok else 'DISCONNECTED'
+    st.markdown(
+        "<div class='top-app-bar'>"
+        "<div class='top-app-bar-title'>THE_DIGITAL_VAULT</div>"
+        f"<span class='{_pill_cls}'>{_pill_txt}</span>"
+        "</div>",
         unsafe_allow_html=True,
     )
 
@@ -1131,12 +1173,12 @@ def main() -> None:
 
     idx = render_status_card(config)
     chips = [
-        f"<span class='mini-stat'>DOCS: {idx.get('file_count', 0)}</span>",
-        f"<span class='mini-stat'>CHUNKS: {idx.get('chunk_count', 0)}</span>",
-        f"<span class='mini-stat'>TOP_K: {config.top_k}</span>",
-        f"<span class='mini-stat'>MODEL: {config.model_name}</span>",
+        f"<span class='mini-stat mono'>DOCS: {idx.get('file_count', 0)}</span>",
+        f"<span class='mini-stat mono'>CHUNKS: {idx.get('chunk_count', 0)}</span>",
+        f"<span class='mini-stat mono'>TOP_K: {config.top_k}</span>",
+        f"<span class='mini-stat mono'>MODEL: {config.model_name}</span>",
     ]
-    st.markdown("".join(chips), unsafe_allow_html=True)
+    st.markdown("<div style='margin-bottom:0.75rem;'>" + "".join(chips) + "</div>", unsafe_allow_html=True)
 
     nav_options = ["LANDING", "PIPELINE", "CHAT_ENGINE", "DEBUG_LOGS", "BATCH_QUEUE"]
     if st.session_state.nav_page not in nav_options:
@@ -1167,7 +1209,11 @@ def main() -> None:
     else:
         render_batch_queue(config)
 
-    st.caption(f"Config file: {Path('config.yaml').resolve()}")
+    st.markdown(
+        f"<div style='padding:0.5rem 0;font-family:monospace;font-size:0.625rem;"
+        f"color:var(--outline);letter-spacing:0.05em;'>CONFIG: {Path('config.yaml').resolve()}</div>",
+        unsafe_allow_html=True,
+    )
     st.markdown("</div>", unsafe_allow_html=True)
 
 
