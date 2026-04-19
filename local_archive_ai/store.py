@@ -73,7 +73,8 @@ class LocalVectorStore:
 
     def _prepare_bm25(self) -> None:
         self.bm25_tokenized_docs = [self._tokenize_text(item.get("text", "")) for item in self.metadata]
-        if BM25Okapi is not None and self.bm25_tokenized_docs:
+        has_tokens = any(len(doc) > 0 for doc in self.bm25_tokenized_docs)
+        if BM25Okapi is not None and self.bm25_tokenized_docs and has_tokens:
             self.bm25 = BM25Okapi(self.bm25_tokenized_docs)
         else:
             self.bm25 = None

@@ -185,10 +185,10 @@ def main() -> None:
         _run_load_repo(args.load_repo)
         sys.exit(0)
 
-    # Default: launch the Streamlit app
-    log.info("Starting Local-Archive AI")
-    from app import main as app_main
-    app_main()
+    # Default: launch the FastAPI web client
+    log.info("Starting Local-Archive AI via FastAPI")
+    import uvicorn
+    uvicorn.run("api:app", host="127.0.0.1", port=8000, reload=True)
 
 
 if __name__ == "__main__":

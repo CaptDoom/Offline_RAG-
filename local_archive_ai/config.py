@@ -13,7 +13,7 @@ SUPPORTED_PYTHON = (3, 12)
 
 
 class AppConfig(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", protected_namespaces=())
 
     chunk_size: int = Field(default=500, ge=1, description="Size of text chunks in tokens")
     top_k: int = Field(default=4, ge=1, description="Number of top results to retrieve")
@@ -74,12 +74,8 @@ def load_config(path: Path | None = None) -> AppConfig:
         _check_duplicate_keys(content)
         payload: dict[str, Any] = yaml.safe_load(content) or {}
 
-    # Strip unknown keys so old configs still load after adding new fields
-    known_fields = set(AppConfig.model_fields.keys())
-    cleaned = {k: v for k, v in payload.items() if k in known_fields}
-
     try:
-        config = AppConfig(**cleaned)
+        config = AppConfig(**payload)
     except ValidationError as e:
         raise ValueError(f"Config validation error: {e}") from e
 

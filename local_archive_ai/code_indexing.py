@@ -72,8 +72,8 @@ class PythonCodeParser:
                 dependencies=PythonCodeParser._extract_imports(tree),
             ))
 
-        # Extract classes
-        for node in ast.walk(tree):
+        # Extract top-level classes and functions directly from tree.body
+        for node in tree.body:
             if isinstance(node, ast.ClassDef):
                 members = []
                 for item in node.body:
@@ -94,12 +94,8 @@ class PythonCodeParser:
                     dependencies=[],
                 ))
 
-            # Extract functions
             elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                # Skip if it's a method (nested in a class)
-                if any(isinstance(parent, ast.ClassDef) for parent in ast.walk(tree)):
-                    continue
-
+                # Only add top-level functions (those directly in tree.body)
                 func_type = 'async_function' if isinstance(node, ast.AsyncFunctionDef) else 'function'
                 source_lines = source.splitlines()[node.lineno - 1:node.end_lineno]
 

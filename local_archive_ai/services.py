@@ -251,7 +251,6 @@ class EmbeddingService:
                     self.__class__._model = SentenceTransformer(
                         "all-MiniLM-L6-v2",
                         cache_folder=str(self._cache_dir),
-                        local_files_only=True,
                         device="cpu",
                     )
                     log.info("Embedding model loaded: all-MiniLM-L6-v2")
@@ -295,6 +294,73 @@ class EmbeddingService:
             norm = np.linalg.norm(vec) + 1e-12
             vectors.append(vec / norm)
         return np.stack(vectors, axis=0)
+
+
+class ImageEmbeddingService:
+    """Embedding service for Image Semantic Search using CLIP."""
+    _model: Any = None
+    _model_attempted = False
+
+    def __init__(self) -> None:
+        self._cache_dir = _MODEL_CACHE_DIR
+        self._cache_dir.mkdir(parents=True, exist_ok=True)
+
+    def _load_model(self) -> None:
+        if self.__class__._model_attempted:
+            return
+        with _EMBED_MODEL_LOCK:
+            if self.__class__._model_attempted:
+                return
+            self.__class__._model_attempted = True
+            if SentenceTransformer is not None:
+                try:
+                    self.__class__._model = SentenceTransformer(
+                        "clip-ViT-B-32",
+                        cache_folder=str(self._cache_dir),
+                        device="cpu",
+                    )
+                    log.info("Image Embedding model loaded: clip-ViT-B-32")
+                except Exception:
+                    self.__class__._model = None
+                    log.warning("Image Embedding model not found locally")
+
+    @property
+    def model(self) -> Any:
+        self._load_model()
+        return self.__class__._model
+
+    def embed_images(self, image_paths: list[str], batch_size: int = 12) -> np.ndarray:
+        self._load_model()
+        if self.model is not None:
+            from PIL import Image
+            batches = []
+            for start in range(0, len(image_paths), max(1, batch_size)):
+                chunk_paths = image_paths[start : start + max(1, batch_size)]
+                images = []
+                for p in chunk_paths:
+                    try:
+                        images.append(Image.open(p).convert("RGB"))
+                    except Exception:
+                        images.append(Image.new('RGB', (224, 224), color='black'))
+                vectors = self.model.encode(
+                    images,
+                    batch_size=len(images),
+                    convert_to_numpy=True,
+                    show_progress_bar=False,
+                    normalize_embeddings=True,
+                )
+                batches.append(np.asarray(vectors, dtype=np.float32))
+            if batches:
+                return np.concatenate(batches, axis=0)
+            return np.empty((0, 512), dtype=np.float32)
+        return np.empty((len(image_paths), 512), dtype=np.float32)
+
+    def embed_text(self, texts: list[str]) -> np.ndarray:
+        self._load_model()
+        if self.model is not None:
+            vectors = self.model.encode(texts, convert_to_numpy=True, normalize_embeddings=True)
+            return np.asarray(vectors, dtype=np.float32)
+        return np.empty((len(texts), 512), dtype=np.float32)
 
 
 def load_reranker_model() -> Any:
@@ -652,7 +718,48 @@ def _read_image_text_resilient(path: Path) -> str:
 
 
 def _read_image_text(path: Path, ocr_engine: str = "tesseract") -> str:
-    """Legacy function for backward compatibility."""
+    """Read text from image with specified OCR engine.
+
+    Args:
+        path: Path to image file
+        ocr_engine: OCR engine to use ('tesseract', 'easyocr', 'paddle')
+
+    Returns:
+        Extracted text string
+
+    Raises:
+        ValueError: If unsupported OCR engine is specified
+    """
+    supported_engines = {"tesseract", "easyocr", "paddle"}
+    if ocr_engine not in supported_engines:
+        raise ValueError(
+            f"Unsupported OCR engine: {ocr_engine}. "
+            f"Must be one of: {', '.join(supported_engines)}"
+        )
+
+    # Try the requested engine first, then fall back to resilient method
+    if ocr_engine == "tesseract" and pytesseract is not None:
+        _configure_tesseract_cmd()
+        try:
+            with Image.open(path) as img:
+                preprocessed = _preprocess_image_for_ocr(img.copy())
+                text = pytesseract.image_to_string(preprocessed, timeout=15)
+                if text.strip():
+                    return _sanitize_text(text)
+        except Exception:
+            pass  # Fall through to fallback
+
+    if ocr_engine == "easyocr" and easyocr is not None:
+        try:
+            reader = easyocr.Reader(["en"], gpu=False, verbose=False)
+            result = reader.readtext(str(path), detail=0)
+            text = "\n".join(result)
+            if text.strip():
+                return _sanitize_text(text)
+        except Exception:
+            pass  # Fall through to fallback
+
+    # For 'paddle' or if primary engine failed, use resilient fallback
     return _read_image_text_resilient(path)
 
 
@@ -686,7 +793,16 @@ def _union_bbox(first: list[int], second: list[int]) -> list[int]:
     ]
 
 
-def _make_image_chunk(blocks: list[dict[str, Any]]) -> dict[str, Any]:
+def _make_image_chunk(blocks: list[dict[str, Any]], chunk_index: int = 0) -> dict[str, Any]:
+    """Create a chunk from image blocks with unique chunk_index.
+
+    Args:
+        blocks: List of OCR blocks to combine into a chunk
+        chunk_index: Globally unique chunk index for this chunk
+
+    Returns:
+        Dict containing chunk data with unique chunk_index
+    """
     chunk_text = " ".join(str(block["text"]).strip() for block in blocks if str(block["text"]).strip())
     chunk_text = _sanitize_text(chunk_text, max_length=1500)
     bbox = blocks[0]["bbox"]
@@ -698,7 +814,7 @@ def _make_image_chunk(blocks: list[dict[str, Any]]) -> dict[str, Any]:
         "file_path": str(blocks[0]["file_path"]),
         "file_name": blocks[0]["file_name"],
         "source_page": None,
-        "chunk_index": 0,
+        "chunk_index": chunk_index,
         "text": chunk_text,
         "block_ids": [block["block_id"] for block in blocks],
         "bounding_boxes": [block["bbox"] for block in blocks],
@@ -803,10 +919,21 @@ def extract_image_blocks(path: Path) -> list[dict[str, Any]]:
     ]
 
 
-def _chunk_image_blocks(blocks: list[dict[str, Any]], chunk_size: int) -> list[dict[str, Any]]:
+def _chunk_image_blocks(blocks: list[dict[str, Any]], chunk_size: int, chunk_index_offset: int = 0) -> tuple[list[dict[str, Any]], int]:
+    """Chunk image blocks with offset-based tracking for unique chunk indices.
+
+    Args:
+        blocks: List of OCR blocks to chunk
+        chunk_size: Maximum chunk size in tokens
+        chunk_index_offset: Starting index for chunk numbering (prevents duplicates)
+
+    Returns:
+        Tuple of (chunks list, final chunk index) for chaining multiple files
+    """
     chunks: list[dict[str, Any]] = []
     current: list[dict[str, Any]] = []
     current_tokens = 0
+    chunk_counter = chunk_index_offset
 
     for block in blocks:
         if not block["text"].strip():
@@ -817,7 +944,8 @@ def _chunk_image_blocks(blocks: list[dict[str, Any]], chunk_size: int) -> list[d
             current_tokens + tokens > chunk_size
             or not _blocks_are_contiguous(current[-1], block)
         ):
-            chunks.append(_make_image_chunk(current))
+            chunks.append(_make_image_chunk(current, chunk_index=chunk_counter))
+            chunk_counter += 1
             current = []
             current_tokens = 0
 
@@ -825,25 +953,35 @@ def _chunk_image_blocks(blocks: list[dict[str, Any]], chunk_size: int) -> list[d
         current_tokens += tokens
 
     if current:
-        chunks.append(_make_image_chunk(current))
+        chunks.append(_make_image_chunk(current, chunk_index=chunk_counter))
+        chunk_counter += 1
 
-    return chunks
+    return chunks, chunk_counter
 
 
-def extract_document_chunks_resilient(path: Path, chunk_size: int, use_code_parsing: bool = True) -> tuple[list[dict[str, Any]], IngestionStatus, str, str, float]:
+def extract_document_chunks_resilient(
+    path: Path,
+    chunk_size: int,
+    use_code_parsing: bool = True,
+    ocr_engine: str = "tesseract",
+    chunk_index_offset: int = 0,
+) -> tuple[list[dict[str, Any]], IngestionStatus, str, str, float, int]:
     """Extract document chunks with resilient processing and status tracking.
-    
+
     Args:
         path: File path to process
         chunk_size: Chunk size in tokens
         use_code_parsing: Use AST-based parsing for code files (default: True)
-    
+        ocr_engine: OCR engine to use for images ('tesseract', 'easyocr', 'paddle')
+        chunk_index_offset: Starting index for chunk numbering (prevents duplicates)
+
     Returns:
         chunks: List of document chunks
         status: Ingestion status
         error_message: Error message if any
         ocr_engine_used: Which extraction method was used
         processing_time: Time taken in seconds
+        final_chunk_index: Final chunk index for chaining multiple files
     """
     import time
     start_time = time.time()
@@ -861,24 +999,25 @@ def extract_document_chunks_resilient(path: Path, chunk_size: int, use_code_pars
                 if CodeRepositoryIndexer.is_code_file(path) and suffix == ".py":
                     chunks = CodeRepositoryIndexer.extract_code_chunks(path)
                     ocr_engine_used = "ast-parsing"
-                    for idx, chunk in enumerate(chunks, start=1):
+                    for idx, chunk in enumerate(chunks, start=chunk_index_offset):
                         metadata = CodeRepositoryIndexer.code_chunk_to_metadata(chunk)
                         metadata["chunk_index"] = idx
                         records.append(metadata)
                     processing_time = time.time() - start_time
+                    final_chunk_index = chunk_index_offset + len(chunks)
                     if records:
-                        return records, IngestionStatus.SUCCESS, "", ocr_engine_used, processing_time
+                        return records, IngestionStatus.SUCCESS, "", ocr_engine_used, processing_time, final_chunk_index
             except Exception as e:
                 # Fallback to text reading if code parsing fails
                 pass
-        
+
         if suffix == ".pdf":
             raw_text = _read_pdf(path)
             ocr_engine_used = "pdf-extraction"
         elif suffix in IMAGE_EXTENSIONS:
             blocks = extract_image_blocks(path)
-            raw_chunks = _chunk_image_blocks(blocks, chunk_size)
-            ocr_engine_used = "image-blocks"
+            raw_chunks, final_chunk_index = _chunk_image_blocks(blocks, chunk_size, chunk_index_offset)
+            ocr_engine_used = f"image-blocks-{ocr_engine}"
         else:
             # Text files
             try:
@@ -887,20 +1026,18 @@ def extract_document_chunks_resilient(path: Path, chunk_size: int, use_code_pars
             except Exception as exc:
                 raise RuntimeError(f"Unable to read file {path}: {exc}") from exc
 
-        global_chunk_index = 0
+        global_chunk_index = chunk_index_offset
         if suffix in IMAGE_EXTENSIONS:
             for chunk in raw_chunks:
                 if not chunk["text"].strip():
                     continue
-                global_chunk_index += 1
-                chunk["chunk_index"] = global_chunk_index
                 records.append(chunk)
+                global_chunk_index = max(global_chunk_index, chunk["chunk_index"] + 1)
         else:
             for chunk in _split_with_tokens(raw_text, chunk_size):
                 chunk = _sanitize_text(chunk)
                 if not chunk:
                     continue
-                global_chunk_index += 1
                 records.append(
                     {
                         "source_file": str(path),
@@ -911,23 +1048,24 @@ def extract_document_chunks_resilient(path: Path, chunk_size: int, use_code_pars
                         "text": chunk,
                     }
                 )
+                global_chunk_index += 1
 
         processing_time = time.time() - start_time
 
         if not records:
-            return records, IngestionStatus.WARNING, "No extractable text found", ocr_engine_used, processing_time
+            return records, IngestionStatus.WARNING, "No extractable text found", ocr_engine_used, processing_time, global_chunk_index
 
-        return records, IngestionStatus.SUCCESS, "", ocr_engine_used, processing_time
+        return records, IngestionStatus.SUCCESS, "", ocr_engine_used, processing_time, global_chunk_index
 
     except Exception as e:
         processing_time = time.time() - start_time
         error_message = str(e)
-        return records, IngestionStatus.ERROR, error_message, ocr_engine_used, processing_time
+        return records, IngestionStatus.ERROR, error_message, ocr_engine_used, processing_time, chunk_index_offset
 
 
 def extract_document_chunks(path: Path, chunk_size: int, ocr_engine: str = "tesseract") -> list[dict[str, Any]]:
     """Legacy function for backward compatibility."""
-    chunks, _, _, _, _ = extract_document_chunks_resilient(path, chunk_size)
+    chunks, _, _, _, _, _ = extract_document_chunks_resilient(path, chunk_size, ocr_engine=ocr_engine)
     return chunks
 
 
@@ -1025,6 +1163,7 @@ def index_documents_resilient(
     # Process files with progress tracking
     new_payload: list[dict[str, Any]] = []
     file_results: list[FileIngestionResult] = []
+    global_chunk_index = len(preserved_payload)  # Start after preserved chunks
 
     progress_iterator = tqdm(files, desc="Processing documents", unit="file") if use_progress_bar and tqdm else files
 
@@ -1050,8 +1189,10 @@ def index_documents_resilient(
                 })
             continue
 
-        # Process file with resilient extraction
-        chunks, status, error_msg, ocr_engine, processing_time = extract_document_chunks_resilient(file_path, chunk_size)
+        # Process file with resilient extraction and offset-based chunk indexing
+        chunks, status, error_msg, ocr_engine, processing_time, global_chunk_index = extract_document_chunks_resilient(
+            file_path, chunk_size, chunk_index_offset=global_chunk_index
+        )
 
         file_result = FileIngestionResult(
             file_path=str(file_path),
@@ -1253,7 +1394,18 @@ def _compose_prompt(
 
     Returns (prompt_text, chunks_used).
     """
-    budget = int(max_context_tokens * 0.75)
+    # Calculate tokens used by the fixed parts of the prompt template
+    template_base = (
+        "You are a local offline assistant for document analysis.\n"
+        "Use only the provided context to answer the question. "
+        "If the answer is not contained in the context, say so clearly.\n\n"
+        "Context:\n\nQuestion: \n\nAnswer:"
+    )
+    template_tokens = _token_count(template_base) + _token_count(question)
+    
+    # Reserve budget for context, ensuring we stay within model limits
+    context_budget = max(0, max_context_tokens - template_tokens - 100)  # 100 token buffer
+    
     context_entries: list[str] = []
     current_tokens = 0
     truncated = False
@@ -1266,22 +1418,30 @@ def _compose_prompt(
             f" :: {chunk_text}"
         )
         entry_tokens = _token_count(entry)
-        if current_tokens + entry_tokens > budget:
+        if current_tokens + entry_tokens > context_budget:
             truncated = True
             break
         context_entries.append(entry)
         current_tokens += entry_tokens
 
     if truncated:
-        log.warning("Context truncated at %d chunks (token budget %d)", len(context_entries), budget)
+        log.warning("Context truncated at %d chunks (token budget %d)", len(context_entries), context_budget)
 
     context = "\n\n".join(context_entries)
     prompt = (
         "You are a local offline assistant for document analysis.\n"
-        "Use only the provided context to answer the question. "
-        "If the answer is not contained in the context, say so clearly.\n\n"
+        "Answer the question based primarily on the provided context.\n"
+        "If the context is insufficient or irrelevant, you may use your general knowledge "
+        "to provide a helpful answer, but clearly state that the local documents did not "
+        "contain the exact information.\n\n"
         f"Context:\n{context}\n\nQuestion: {question}\n\nAnswer:"
     )
+    
+    # Final check: ensure total prompt doesn't exceed model limit
+    total_tokens = _token_count(prompt)
+    if total_tokens > max_context_tokens:
+        log.error("Prompt exceeds token limit: %d > %d", total_tokens, max_context_tokens)
+    
     return prompt, len(context_entries)
 
 
@@ -1471,8 +1631,8 @@ def answer_query(
     # Prepend low-confidence warning (Problem P)
     if low_confidence and answer and not answer.startswith("Ollama") and not answer.startswith("Connection"):
         answer = (
-            "**Low Confidence Warning:** The documents may not clearly answer this question "
-            f"(max similarity: {max_similarity:.3f}).\n\n{answer}"
+            "*(Note: The retrieved documents had low relevance to this query. Max similarity: "
+            f"{max_similarity:.3f})*\n\n{answer}"
         )
 
     citations = []
@@ -1559,12 +1719,63 @@ def index_image_documents(
     store_path: str,
     on_progress: Callable[[dict[str, Any]], None] | None = None,
 ) -> IndexReport:
-    return index_documents(
-        folder_path=folder_path,
-        chunk_size=chunk_size,
-        store_path=store_path,
-        on_progress=on_progress,
-        file_filter=lambda path: path.suffix.lower() in IMAGE_EXTENSIONS,
+    folder = Path(folder_path).expanduser().resolve()
+    files = [p for p in folder.rglob("*") if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS]
+    if not files:
+        raise ValueError("No supported image files found in folder.")
+    
+    file_results = []
+    payload = []
+    image_paths = []
+    start_time = time.time()
+    
+    for idx, path in enumerate(files):
+        image_paths.append(str(path))
+        payload_item = {
+            "text": "",
+            "file_name": path.name,
+            "source_page": 1,
+            "chunk_index": idx,
+            "file_path": str(path.resolve()),
+        }
+        payload.append(payload_item)
+        file_results.append(FileIngestionResult(file_path=str(path), file_name=path.name, status=IngestionStatus.SUCCESS))
+
+        if on_progress is not None:
+            on_progress({
+                "current_file": path.name,
+                "processed_files": idx,
+                "total_files": len(files),
+                "chunk_count": len(payload),
+                "status": "success",
+                "error": ""
+            })
+    
+    embedder = ImageEmbeddingService()
+    vectors = embedder.embed_images(image_paths, batch_size=12)
+    
+    vector_store = LocalVectorStore(Path(store_path))
+    vector_store.build(vectors, payload)
+    
+    total_time = time.time() - start_time
+    report = IngestionReport(
+        total_files=len(files), processed_files=len(files), successful_files=len(files), warning_files=0, error_files=0, skipped_files=0,
+        total_chunks=len(payload), completed_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"), processing_time_seconds=total_time, file_results=file_results, success_rate=100.0,
+    )
+    legacy_report = {
+        "file_count": len(files),
+        "chunk_count": len(payload),
+        "completed_at": report.completed_at,
+        "index_path": str(Path(store_path).resolve()),
+        "faiss_enabled": vector_store.faiss_enabled,
+        "success_rate": 100.0,
+        "error_files": 0,
+    }
+    with (Path(store_path) / "index_status.json").open("w", encoding="utf-8") as fh:
+        json.dump(legacy_report, fh, indent=2)
+
+    return IndexReport(
+        file_count=len(files), chunk_count=len(payload), completed_at=report.completed_at, index_path=str(Path(store_path).resolve()), faiss_enabled=vector_store.faiss_enabled
     )
 
 
@@ -1575,28 +1786,41 @@ def search_image_chunks(
     retrieval_mode: str = "vector",
     bm25_weight: float = 0.4,
 ) -> list[dict[str, Any]]:
-    hits = search_index(
-        query=query,
-        top_k=top_k,
-        store_path=store_path,
-        retrieval_mode=retrieval_mode,
-        bm25_weight=bm25_weight,
-    )
-    payload: list[dict[str, Any]] = []
-    for hit in hits:
-        payload.append(
-            {
-                "file_path": hit.metadata.get("file_path", ""),
-                "file_name": hit.metadata.get("file_name", "unknown"),
-                "score": float(hit.score),
-                "chunk_index": hit.metadata.get("chunk_index"),
-                "text": hit.text,
-                "bbox": hit.metadata.get("bbox"),
-                "bounding_boxes": hit.metadata.get("bounding_boxes", []),
-                "block_ids": hit.metadata.get("block_ids", []),
-            }
-        )
-    return payload
+    embedder = ImageEmbeddingService()
+    query_vec = embedder.embed_text([query])[0]
+    
+    store = LocalVectorStore(Path(store_path))
+    if not store.load() or not store.ready():
+        raise RuntimeError("Image index is not loaded. Please index images first.")
+    
+    if store.index is None:
+        raise RuntimeError("FAISS is required for Semantic Search.")
+
+    k = min(top_k, len(store.metadata))
+    if k == 0:
+        return []
+
+    D, I = store.index.search(np.array([query_vec], dtype=np.float32), k)
+    
+    results = []
+    for i in range(len(I[0])):
+        idx = int(I[0][i])
+        dist = float(D[0][i])
+        if idx < 0 or idx >= len(store.metadata):
+            continue
+            
+        m = store.metadata[idx]
+        results.append({
+            "file_path": m.get("file_path", ""),
+            "file_name": m.get("file_name", "unknown"),
+            "score": dist,
+            "chunk_index": m.get("chunk_index"),
+            "text": m.get("text", ""),
+            "bbox": None,
+            "bounding_boxes": [],
+            "block_ids": [],
+        })
+    return results
 
 
 def check_ollama_status(endpoint: str = "http://127.0.0.1:11434", api_key: str = "") -> bool:

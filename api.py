@@ -4,7 +4,10 @@ import tempfile
 import zipfile
 from pathlib import Path
 
-from fastapi import FastAPI, File, Form, UploadFile
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI, File, Form, UploadFile, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -16,15 +19,27 @@ from local_archive_ai.services import (
     check_ollama_status,
     get_index_status,
     index_documents,
+    index_image_documents,
     load_index_metadata,
     runtime_mode,
+    search_image_chunks,
     system_checks,
     vector_diagnostics,
 )
 
-app = FastAPI(title="Local Archive AI Backend")
+IMAGE_STORE_PATH = "data/image_faiss_index"
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Preflight check on startup
+    try:
+        config = load_config()
+        system_checks(config.faiss_path, config.model_name, endpoint=config.ollama_endpoint, api_key=config.ollama_api_key)
+    except Exception as e:
+        print(f"Warning: Startup system check failed: {e}")
+    yield
 
+app = FastAPI(title="Local Archive AI Backend", lifespan=lifespan)
 @app.get("/")
 def read_index() -> FileResponse:
     return FileResponse("static/index.html")
@@ -41,6 +56,13 @@ class BatchQueryRequest(BaseModel):
     queries: list[str]
 
 
+class ImageSearchRequest(BaseModel):
+    query: str
+    top_k: int = 5
+    retrieval_mode: str = "vector"
+    bm25_weight: float = 0.4
+
+
 class ConfigUpdateRequest(BaseModel):
     chunk_size: int
     top_k: int
@@ -52,6 +74,8 @@ class ConfigUpdateRequest(BaseModel):
     ollama_endpoint: str
     retrieval_mode: str
     ocr_engine: str
+    
+    model_config = {"protected_namespaces": ()}
 
 
 def _ok(**payload: object) -> dict[str, object]:
@@ -69,6 +93,19 @@ def _config() -> AppConfig:
     return load_config()
 
 
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
+    err_msgs = [f"{err.get('loc')}: {err.get('msg')}" for err in exc.errors()]
+    return _error(f"Validation error: {', '.join(err_msgs)}", status_code=422)
+
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+    import traceback
+    traceback.print_exc()
+    return _error(f"Internal server error: {str(exc)}", status_code=500)
+
+
 @app.get("/api/status")
 def get_status() -> dict[str, object]:
     config = _config()
@@ -81,6 +118,7 @@ def get_status() -> dict[str, object]:
     )
     return _ok(
         index=idx,
+        image_index=get_index_status(IMAGE_STORE_PATH),
         mode=runtime_mode(),
         checks=checks,
         diagnostics=vector_diagnostics(config.faiss_path, sample_size=10),
@@ -247,6 +285,74 @@ async def build_index(folder_path: str | None = Form(default=None), files: list[
     finally:
         if tmp_dir is not None:
             tmp_dir.cleanup()
+
+
+@app.post("/api/image/index")
+async def build_image_index(folder_path: str | None = Form(default=None), files: list[UploadFile] | None = File(default=None)):
+    config = _config()
+    tmp_dir: tempfile.TemporaryDirectory[str] | None = None
+
+    try:
+        folder_to_index = folder_path.strip() if folder_path else ""
+        if files:
+            tmp_dir = tempfile.TemporaryDirectory(prefix="local_archive_image_")
+            for upload in files:
+                if not upload.filename:
+                    continue
+                file_path = Path(tmp_dir.name) / upload.filename
+                file_path.write_bytes(await upload.read())
+            folder_to_index = tmp_dir.name
+
+        if not folder_to_index:
+            return _error("No folder path or image files provided.")
+
+        folder = Path(folder_to_index).expanduser()
+        if not folder.exists():
+            return _error(f"Folder not found: {folder}")
+
+        report = index_image_documents(
+            folder_path=str(folder),
+            chunk_size=config.chunk_size,
+            store_path=IMAGE_STORE_PATH,
+            on_progress=None,
+        )
+        return _ok(
+            status="success",
+            file_count=report.file_count,
+            chunk_count=report.chunk_count,
+            index_path=report.index_path,
+        )
+    except Exception as exc:
+        return _error(str(exc))
+    finally:
+        if tmp_dir is not None:
+            tmp_dir.cleanup()
+
+
+@app.post("/api/image/search")
+def image_search(req: ImageSearchRequest) -> dict[str, object]:
+    query = req.query.strip()
+    if not query:
+        return _error("Query cannot be empty.")
+
+    idx = get_index_status(IMAGE_STORE_PATH)
+    if not idx.get("exists"):
+        return _error(
+            "No image index is ready. Index images before querying.",
+            status_code=404,
+        )
+
+    try:
+        results = search_image_chunks(
+            query=query,
+            top_k=req.top_k,
+            store_path=IMAGE_STORE_PATH,
+            retrieval_mode=req.retrieval_mode,
+            bm25_weight=req.bm25_weight,
+        )
+        return _ok(results=results)
+    except Exception as exc:
+        return _error(str(exc))
 
 
 @app.get("/api/vault")

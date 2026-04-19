@@ -24,6 +24,7 @@ from local_archive_ai.services import (
     collect_files,
     summarize_indexable_content,
     index_documents_resilient,
+    IngestionStatus,
 )
 from local_archive_ai.code_indexing import CodeRepositoryIndexer, PythonCodeParser
 
@@ -36,17 +37,17 @@ def temp_index_dir():
 
 
 @pytest.fixture
-def sample_text_file():
+def sample_text_file(temp_index_dir):
     """Create a sample text file for testing"""
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
+    with tempfile.NamedTemporaryFile(dir=temp_index_dir, mode='w', suffix='.txt', delete=False) as f:
         f.write("This is a test document.\nIt has multiple lines.\nFor testing purposes.")
         return Path(f.name)
 
 
 @pytest.fixture
-def sample_python_file():
+def sample_python_file(temp_index_dir):
     """Create a sample Python file for testing"""
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
+    with tempfile.NamedTemporaryFile(dir=temp_index_dir, mode='w', suffix='.py', delete=False) as f:
         f.write('''
 """
 Module for testing code indexing.
@@ -75,9 +76,9 @@ async def async_function():
 
 
 @pytest.fixture
-def sample_image_file():
+def sample_image_file(temp_index_dir):
     """Create a sample image file with text"""
-    with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as f:
+    with tempfile.NamedTemporaryFile(dir=temp_index_dir, suffix='.png', delete=False) as f:
         # Create simple test image
         img = PILImage.new('RGB', (200, 100), color='white')
         img.save(f.name)
@@ -85,11 +86,11 @@ def sample_image_file():
 
 
 @pytest.fixture
-def sample_pdf_file():
+def sample_pdf_file(temp_index_dir):
     """Create a simple PDF for testing (requires reportlab)"""
     try:
         from reportlab.pdfgen import canvas
-        with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as f:
+        with tempfile.NamedTemporaryFile(dir=temp_index_dir, suffix='.pdf', delete=False) as f:
             c = canvas.Canvas(f.name)
             c.drawString(100, 750, "This is a test PDF document")
             c.drawString(100, 730, "With multiple lines of text")
@@ -164,7 +165,7 @@ class TestDocumentIngest:
 
     def test_ingest_text_file(self, sample_text_file):
         """Test ingesting plain text file"""
-        chunks, status, error, engine, time_taken = extract_document_chunks_resilient(
+        chunks, status, error, engine, time_taken, final_chunk_index = extract_document_chunks_resilient(
             sample_text_file, chunk_size=100
         )
         assert len(chunks) > 0
@@ -173,7 +174,7 @@ class TestDocumentIngest:
 
     def test_ingest_python_file(self, sample_python_file):
         """Test ingesting Python file with code parsing"""
-        chunks, status, error, engine, time_taken = extract_document_chunks_resilient(
+        chunks, status, error, engine, time_taken, final_chunk_index = extract_document_chunks_resilient(
             sample_python_file, chunk_size=500, use_code_parsing=True
         )
         # Should have chunks for modules, functions, classes
@@ -183,7 +184,7 @@ class TestDocumentIngest:
 
     def test_ingest_with_fallback(self, sample_python_file):
         """Test that code parsing falls back to text if needed"""
-        chunks, status, error, engine, time_taken = extract_document_chunks_resilient(
+        chunks, status, error, engine, time_taken, final_chunk_index = extract_document_chunks_resilient(
             sample_python_file, chunk_size=500, use_code_parsing=True
         )
         assert len(chunks) > 0
@@ -314,11 +315,14 @@ class TestErrorHandling:
 
     def test_missing_file_handling(self, temp_index_dir):
         """Test handling of missing files"""
-        with pytest.raises(Exception):
-            extract_document_chunks_resilient(
-                Path("/nonexistent/file.txt"),
-                chunk_size=100,
-            )
+        chunks, status, error, engine, time_taken, final_chunk_index = extract_document_chunks_resilient(
+            Path("/nonexistent/file.txt"),
+            chunk_size=100,
+        )
+        # Should return error status, not raise
+        assert status == IngestionStatus.ERROR
+        assert len(chunks) == 0
+        assert error  # Should have an error message
 
     def test_empty_directory_handling(self):
         """Test handling of empty directories"""

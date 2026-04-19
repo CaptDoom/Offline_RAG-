@@ -277,25 +277,27 @@ class ChatEngine:
         )
 
         if memory_context:
-            # Inject memory context into the prompt
-            prompt = (
-                "You are a local offline assistant for document analysis.\n"
-                "Use only the provided context to answer the question. "
-                "If the answer is not contained in the context, say so clearly.\n\n"
-                f"{memory_context}\n"
-                f"{retrieval_prompt.split('Context:', 1)[-1] if 'Context:' in retrieval_prompt else retrieval_prompt}"
-            )
-            # Re-wrap if we split the prompt
-            if "Context:" not in prompt:
-                prompt = retrieval_prompt
+            # Extract the context part from retrieval prompt and combine with memory
+            if "Context:" in retrieval_prompt and "\n\nQuestion:" in retrieval_prompt:
+                # Split to get the context section
+                before_context = retrieval_prompt.split("Context:")[0]
+                after_context_marker = retrieval_prompt.split("Context:")[1]
+                if "\n\nQuestion:" in after_context_marker:
+                    context_part = after_context_marker.split("\n\nQuestion:")[0]
+                    question_part = "\n\nQuestion:" + after_context_marker.split("\n\nQuestion:")[1]
+                    
+                    # Rebuild prompt with memory inserted before context
+                    prompt = (
+                        f"{before_context.rstrip()}\n\n"
+                        f"{memory_context}\n\n"
+                        f"Context:{context_part}{question_part}"
+                    )
+                else:
+                    # Fallback: just prepend memory to the full prompt
+                    prompt = f"{memory_context}\n\n{retrieval_prompt}"
             else:
-                prompt = (
-                    "You are a local offline assistant for document analysis.\n"
-                    "Use only the provided context to answer the question. "
-                    "If the answer is not contained in the context, say so clearly.\n\n"
-                    f"{memory_context}\n"
-                    f"Context:{retrieval_prompt.split('Context:', 1)[-1]}"
-                )
+                # Fallback: just prepend memory to the full prompt
+                prompt = f"{memory_context}\n\n{retrieval_prompt}"
         else:
             prompt = retrieval_prompt
 

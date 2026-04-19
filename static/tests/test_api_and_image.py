@@ -9,6 +9,7 @@ from fastapi.testclient import TestClient
 
 import api
 from local_archive_ai.config import AppConfig
+from local_archive_ai import services as local_services
 from local_archive_ai.services import index_image_documents, load_index_metadata, search_image_chunks, search_index
 from local_archive_ai.store import LocalVectorStore
 
@@ -113,10 +114,11 @@ def test_search_index_hybrid_rerank_falls_back_without_local_reranker(monkeypatc
     LocalVectorStore(store_path).build(vectors, metadata)
 
     monkeypatch.setattr(
-        "local_archive_ai.services.EmbeddingService.embed",
+        local_services.EmbeddingService,
+        "embed",
         lambda self, texts, batch_size=16: np.asarray([[1.0, 0.0, 0.0] for _ in texts], dtype=np.float32),
     )
-    monkeypatch.setattr("local_archive_ai.services.load_reranker_model", lambda: None)
+    monkeypatch.setattr(local_services, "load_reranker_model", lambda: None)
 
     hits = search_index(
         query="invoice",
@@ -137,20 +139,17 @@ def test_image_index_and_search_fixture(monkeypatch, tmp_path: Path) -> None:
     image_file.write_bytes(b"fake-image")
 
     monkeypatch.setattr(
-        "local_archive_ai.services.extract_image_blocks",
-        lambda path: [
-            {
-                "block_id": "b1",
-                "file_path": str(path),
-                "file_name": path.name,
-                "bbox": [0, 0, 100, 20],
-                "text": "invoice balance due",
-            }
-        ],
+        local_services.ImageEmbeddingService,
+        "embed_images",
+        lambda self, paths, batch_size=16: np.asarray(
+            [[1.0, 0.0, 0.0] for _ in paths],
+            dtype=np.float32,
+        ),
     )
     monkeypatch.setattr(
-        "local_archive_ai.services.EmbeddingService.embed",
-        lambda self, texts, batch_size=16: np.asarray(
+        local_services.ImageEmbeddingService,
+        "embed_text",
+        lambda self, texts: np.asarray(
             [
                 [1.0, 0.0, 0.0] if "invoice" in text.lower() else [0.0, 1.0, 0.0]
                 for text in texts

@@ -23,3 +23,5 @@ tqdm
 watchdog
 opencv-python-headless
 pandas
+pytest
+httpx

@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>LOCAL-ARCHIVE AI</title>
-    <link rel="stylesheet" href="/static/style.css">
+    <link rel="stylesheet" href="/static/style.css?v=2">
 </head>
 <body>
     <div class="app-container">
@@ -34,6 +34,10 @@
                     <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"></path><polyline points="3.27 6.96 12 12.01 20.73 6.96"></polyline><line x1="12" y1="22.08" x2="12" y2="12"></line></svg>
                     Batch
                 </a>
+                <a href="#" class="nav-item" data-target="view-images">
+                    <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"></rect><circle cx="8.5" cy="8.5" r="1.5"></circle><path d="M21 15l-5-5-4 4-3-3-5 5"></path></svg>
+                    Image Search
+                </a>
             </nav>
 
             <div class="indexing-engine-panel">
@@ -41,6 +45,7 @@
                  <div class="input-row">
                     <input type="text" id="folder-path" value="" placeholder="Path to local docs">
                     <button id="browse-btn">BROWSE</button>
+                    <input type="file" id="main-file-input" multiple webkitdirectory directory style="display: none;">
                  </div>
                  <div class="status-row">
                     <span>Files found: <strong id="files-found">0</strong></span>
@@ -63,6 +68,7 @@
                     <a href="#" class="top-tab active" data-target="view-chat">CHAT_ENGINE</a>
                     <a href="#" class="top-tab" data-target="view-debug">DEBUG_LOGS</a>
                     <a href="#" class="top-tab" data-target="view-batch">BATCH_QUEUE</a>
+                    <a href="#" class="top-tab" data-target="view-images">IMAGE_SEARCH</a>
                 </div>
                 <div class="topbar-right">
                     <div class="system-ready-pill" id="system-readiness">
@@ -191,10 +197,60 @@ You are a highly specialized AI assistant focused on technical documentation ret
                         </div>
                     </div>
                 </div>
+
+                <div id="view-images" class="view">
+                    <div class="image-header">
+                        <div>
+                            <h2>IMAGE SEMANTIC SEARCH</h2>
+                            <p class="mono-stat">Search OCR chunks from JPG, PNG, TIFF, BMP, and WEBP images.</p>
+                        </div>
+                        <div class="image-status-row">
+                            <span>Image chunks: <strong id="image-chunk-count">0</strong></span>
+                            <span class="status-ready" id="image-index-status">OFFLINE</span>
+                        </div>
+                    </div>
+
+                    <div class="image-index-panel">
+                        <div class="input-row">
+                            <input type="text" id="image-folder-path" placeholder="Path to local image folder">
+                            <button id="image-browse-btn">BROWSE</button>
+                        </div>
+                        <div class="input-row">
+                            <input type="file" id="image-file-input" accept="image/*" multiple webkitdirectory directory>
+                        </div>
+                        <div class="image-actions">
+                            <button class="secondary-btn" id="image-index-clear-btn">CLEAR INPUTS</button>
+                            <button class="primary-btn" id="image-index-btn">INDEX_IMAGES</button>
+                        </div>
+                    </div>
+
+                    <div class="image-search-panel">
+                        <div class="input-row">
+                            <input type="text" id="image-query" placeholder="Enter image search query...">
+                        </div>
+                        <div class="input-row">
+                            <select id="image-top-k">
+                                <option value="3">Top 3</option>
+                                <option value="5" selected>Top 5</option>
+                                <option value="8">Top 8</option>
+                            </select>
+                            <select id="image-retrieval-mode">
+                                <option value="vector">vector</option>
+                                <option value="hybrid">hybrid</option>
+                                <option value="hybrid+rerank">hybrid+rerank</option>
+                            </select>
+                            <button class="primary-btn" id="image-search-btn">SEARCH_IMAGES</button>
+                        </div>
+                    </div>
+
+                    <div id="image-results-grid" class="chunks-grid">
+                        <!-- Image results injected here -->
+                    </div>
+                </div>
             </div>
         </main>
     </div>
     
-    <script src="/static/app.js"></script>
+    <script src="/static/app.js?v=2"></script>
 </body>
 </html>

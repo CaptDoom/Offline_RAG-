@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+# Deprecated: Streamlit frontends are no longer the primary application interface.
+# Use the FastAPI client instead: `uvicorn api:app --reload`
+
 import tempfile
 from pathlib import Path
 from tkinter import Tk, filedialog
