@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>LOCAL-ARCHIVE AI</title>
-    <link rel="stylesheet" href="/static/style.css?v=2">
+    <link rel="stylesheet" href="/static/style.css?v=3">
 </head>
 <body>
     <div class="app-container">
@@ -43,10 +43,13 @@
             <div class="indexing-engine-panel">
                  <div class="panel-title">INDEXING ENGINE</div>
                  <div class="input-row">
-                    <input type="text" id="folder-path" value="" placeholder="Path to local docs">
-                    <button id="browse-btn">BROWSE</button>
-                    <input type="file" id="main-file-input" multiple webkitdirectory directory style="display: none;">
+                    <input type="text" id="folder-path" value="" placeholder="Select files, images, PDFs, or folders" readonly>
+                    <button id="browse-file-btn">FILES</button>
+                    <button id="browse-dir-btn">FOLDER</button>
+                    <input type="file" id="main-file-input" multiple accept=".txt,.md,.pdf,.json,.csv,.py,.js,.ts,.tsx,.jsx,.java,.c,.cpp,.go,.rs,.html,.css,.sql,.yaml,.yml,.toml,.ini,.zip,.png,.jpg,.jpeg,.gif,.bmp,.tiff,.tif,.webp" style="display: none;">
+                    <input type="file" id="main-dir-input" multiple webkitdirectory directory style="display: none;">
                  </div>
+                 <div class="source-summary" id="main-source-summary"></div>
                  <div class="status-row">
                     <span>Files found: <strong id="files-found">0</strong></span>
                     <span class="status-ready" id="sidebar-index-ready">READY</span>
@@ -212,11 +215,14 @@ You are a highly specialized AI assistant focused on technical documentation ret
 
                     <div class="image-index-panel">
                         <div class="input-row">
-                            <input type="text" id="image-folder-path" placeholder="Path to local image folder">
-                            <button id="image-browse-btn">BROWSE</button>
+                            <input type="text" id="image-folder-path" placeholder="Select image files or folders" readonly>
+                            <button id="image-browse-file-btn">FILES</button>
+                            <button id="image-browse-dir-btn">FOLDER</button>
                         </div>
+                        <div class="source-summary" id="image-source-summary"></div>
                         <div class="input-row">
-                            <input type="file" id="image-file-input" accept="image/*" multiple webkitdirectory directory>
+                            <input type="file" id="image-file-input" accept="image/*" multiple style="display: none;">
+                            <input type="file" id="image-dir-input" accept="image/*" multiple webkitdirectory directory style="display: none;">
                         </div>
                         <div class="image-actions">
                             <button class="secondary-btn" id="image-index-clear-btn">CLEAR INPUTS</button>
@@ -251,6 +257,6 @@ You are a highly specialized AI assistant focused on technical documentation ret
         </main>
     </div>
     
-    <script src="/static/app.js?v=2"></script>
+    <script src="/static/app.js?v=3"></script>
 </body>
 </html>

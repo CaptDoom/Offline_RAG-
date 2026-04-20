@@ -483,6 +483,13 @@ class ChatEngine:
             duration_ms=duration_ms,
             chunks_used=chunks_used,
             debug_payload={
+                "pipeline_checks": {
+                    "index_loaded": True,
+                    "retrieval_succeeded": bool(hits),
+                    "context_injected": bool(prompt and citations),
+                    "generation_attempted": True,
+                    "generation_succeeded": bool(answer and not answer.startswith("Generation error")),
+                },
                 "embedding_preview": [float(x) for x in query_vec[:16]],
                 "retrieved_chunks": [
                     {

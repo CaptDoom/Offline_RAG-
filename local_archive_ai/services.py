@@ -133,7 +133,7 @@ SKIP_DIRECTORIES = {
     "dist",
     "build",
 }
-IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".webp"}
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".tiff", ".tif", ".webp"}
 _ROOT_DIR = Path(__file__).resolve().parent.parent
 _MODEL_CACHE_DIR = _ROOT_DIR / "data" / "models"
 _EMBED_MODEL_LOCK = threading.Lock()
@@ -157,6 +157,12 @@ def _get_ollama_session() -> requests.Session:
                 _ollama_session.mount("http://", adapter)
                 _ollama_session.mount("https://", adapter)
     return _ollama_session
+
+
+def _force_offline_transformers_env() -> None:
+    os.environ.setdefault("HF_HUB_OFFLINE", "1")
+    os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+    os.environ.setdefault("HF_DATASETS_OFFLINE", "1")
 
 
 class IngestionStatus(Enum):
@@ -248,15 +254,17 @@ class EmbeddingService:
             self.__class__._model_attempted = True
             if SentenceTransformer is not None:
                 try:
+                    _force_offline_transformers_env()
                     self.__class__._model = SentenceTransformer(
                         "all-MiniLM-L6-v2",
                         cache_folder=str(self._cache_dir),
                         device="cpu",
+                        local_files_only=True,
                     )
                     log.info("Embedding model loaded: all-MiniLM-L6-v2")
-                except Exception:
+                except Exception as exc:
                     self.__class__._model = None
-                    log.warning("Embedding model not found locally, using fallback")
+                    log.warning("Embedding model unavailable offline, using fallback: %s", exc)
 
     @property
     def model(self) -> Any:
@@ -314,15 +322,17 @@ class ImageEmbeddingService:
             self.__class__._model_attempted = True
             if SentenceTransformer is not None:
                 try:
+                    _force_offline_transformers_env()
                     self.__class__._model = SentenceTransformer(
                         "clip-ViT-B-32",
                         cache_folder=str(self._cache_dir),
                         device="cpu",
+                        local_files_only=True,
                     )
                     log.info("Image Embedding model loaded: clip-ViT-B-32")
-                except Exception:
+                except Exception as exc:
                     self.__class__._model = None
-                    log.warning("Image Embedding model not found locally")
+                    log.warning("Image embedding model unavailable offline: %s", exc)
 
     @property
     def model(self) -> Any:
@@ -543,16 +553,21 @@ class HybridRetriever:
             return candidates[:top_n]
 
 
+_SPLITTER_CACHE = {}
 def _build_splitter(chunk_size: int) -> RecursiveCharacterTextSplitter | None:
     if RecursiveCharacterTextSplitter is None or tiktoken is None:
         return None
+    if chunk_size in _SPLITTER_CACHE:
+        return _SPLITTER_CACHE[chunk_size]
     # cl100k_base aligns with modern token budgeting and avoids word-count drift.
-    return RecursiveCharacterTextSplitter.from_tiktoken_encoder(
+    splitter = RecursiveCharacterTextSplitter.from_tiktoken_encoder(
         encoding_name="cl100k_base",
         chunk_size=chunk_size,
         chunk_overlap=max(60, int(chunk_size * 0.15)),
         separators=["\n\n", "\n", ". ", " ", ""],
     )
+    _SPLITTER_CACHE[chunk_size] = splitter
+    return splitter
 
 
 def _split_with_tokens(text: str, chunk_size: int) -> list[str]:
@@ -1127,6 +1142,7 @@ def index_documents_resilient(
     on_progress: Callable[[dict[str, Any]], None] | None = None,
     use_progress_bar: bool = True,
     file_filter: Callable[[Path], bool] | None = None,
+    ocr_engine: str = "tesseract",
 ) -> IngestionReport:
     """Index documents with resilient ingestion, progress tracking, and detailed reporting."""
     import time
@@ -1148,17 +1164,26 @@ def index_documents_resilient(
     current_hashes: dict[str, str] = {}
     preserved_payload: list[dict[str, Any]] = []
 
-    # Calculate file hashes
-    for file_path in files:
-        file_hash = vector_store._hash_file(file_path)
-        current_hashes[str(file_path)] = file_hash
+    # Calculate file hashes concurrently to maximize IO throughput
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=min(16, len(files))) as executor:
+        fs = {executor.submit(vector_store._hash_file, fp): fp for fp in files}
+        for future in fs:
+            fp = fs[future]
+            try:
+                current_hashes[str(fp)] = future.result()
+            except Exception as e:
+                log.warning(f"Failed to hash {fp}: {e}")
+                current_hashes[str(fp)] = ""  # Force re-ingestion if hashing fails
 
     # Preserve unchanged files
+    preserved_indices = []
     if existing and existing_hashes:
-        for chunk in vector_store.metadata:
+        for i, chunk in enumerate(vector_store.metadata):
             file_path = str(chunk.get("file_path", ""))
             if file_path in current_hashes and existing_hashes.get(file_path) == current_hashes[file_path]:
                 preserved_payload.append(chunk)
+                preserved_indices.append(i)
 
     # Process files with progress tracking
     new_payload: list[dict[str, Any]] = []
@@ -1190,8 +1215,11 @@ def index_documents_resilient(
             continue
 
         # Process file with resilient extraction and offset-based chunk indexing
-        chunks, status, error_msg, ocr_engine, processing_time, global_chunk_index = extract_document_chunks_resilient(
-            file_path, chunk_size, chunk_index_offset=global_chunk_index
+        chunks, status, error_msg, ocr_engine_used, processing_time, global_chunk_index = extract_document_chunks_resilient(
+            file_path,
+            chunk_size,
+            ocr_engine=ocr_engine,
+            chunk_index_offset=global_chunk_index,
         )
 
         file_result = FileIngestionResult(
@@ -1200,7 +1228,7 @@ def index_documents_resilient(
             status=status,
             chunks_count=len(chunks),
             error_message=error_msg,
-            ocr_engine_used=ocr_engine,
+            ocr_engine_used=ocr_engine_used,
             processing_time_seconds=processing_time,
             file_hash=file_hash,
         )
@@ -1225,9 +1253,24 @@ def index_documents_resilient(
     if not payload:
         raise ValueError("No extractable text chunks found in supported documents.")
 
-    # Generate embeddings in small batches to keep memory stable on large indexes.
-    texts = [item["text"] for item in payload]
-    vectors = EmbeddingService().embed(texts, batch_size=12)
+    # Embed new texts
+    if new_payload:
+        texts = [item["text"] for item in new_payload]
+        new_vectors = EmbeddingService().embed(texts, batch_size=12)
+    else:
+        new_vectors = np.empty((0, EmbeddingService().model.get_sentence_embedding_dimension() if EmbeddingService().model else 384), dtype=np.float32)
+
+    # Reconstruct preserved vectors
+    if preserved_indices and vector_store.index is not None:
+        kept_vectors = np.array(
+            [vector_store.index.reconstruct(int(i)) for i in preserved_indices], dtype=np.float32
+        )
+        if new_vectors.size > 0:
+            vectors = np.vstack([kept_vectors, new_vectors])
+        else:
+            vectors = kept_vectors
+    else:
+        vectors = new_vectors
 
     # Build vector store
     vector_store = LocalVectorStore(Path(store_path))
@@ -1284,6 +1327,7 @@ def index_documents(
     store_path: str,
     on_progress: Callable[[dict[str, Any]], None] | None = None,
     file_filter: Callable[[Path], bool] | None = None,
+    ocr_engine: str = "tesseract",
 ) -> IndexReport:
     """Legacy index function with resilient processing internally."""
     # Use resilient indexing but convert to legacy IndexReport format
@@ -1294,6 +1338,7 @@ def index_documents(
         on_progress=on_progress,
         use_progress_bar=False,  # Let the UI handle progress
         file_filter=file_filter,
+        ocr_engine=ocr_engine,
     )
 
     # Convert IngestionReport to IndexReport for backward compatibility
@@ -1430,10 +1475,9 @@ def _compose_prompt(
     context = "\n\n".join(context_entries)
     prompt = (
         "You are a local offline assistant for document analysis.\n"
-        "Answer the question based primarily on the provided context.\n"
-        "If the context is insufficient or irrelevant, you may use your general knowledge "
-        "to provide a helpful answer, but clearly state that the local documents did not "
-        "contain the exact information.\n\n"
+        "Answer the question using only the provided context.\n"
+        "If the context is insufficient or irrelevant, say that the indexed local documents "
+        "do not contain enough information to answer reliably.\n\n"
         f"Context:\n{context}\n\nQuestion: {question}\n\nAnswer:"
     )
     
@@ -1662,6 +1706,13 @@ def answer_query(
         "low_confidence": low_confidence,
         "duration_ms": duration_ms,
         "debug_payload": {
+            "pipeline_checks": {
+                "index_loaded": True,
+                "retrieval_succeeded": bool(hits),
+                "context_injected": bool(prompt and citations),
+                "generation_attempted": True,
+                "generation_succeeded": bool(answer and not answer.startswith("Error generating response")),
+            },
             "embedding_preview": [float(x) for x in query_vec[:16]],
             "retrieved_chunks": [
                 {
@@ -1718,49 +1769,76 @@ def index_image_documents(
     chunk_size: int,
     store_path: str,
     on_progress: Callable[[dict[str, Any]], None] | None = None,
+    ocr_engine: str = "tesseract",
 ) -> IndexReport:
     folder = Path(folder_path).expanduser().resolve()
     files = [p for p in folder.rglob("*") if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS]
     if not files:
         raise ValueError("No supported image files found in folder.")
-    
-    file_results = []
-    payload = []
-    image_paths = []
+
+    file_results: list[FileIngestionResult] = []
+    payload: list[dict[str, Any]] = []
+    current_chunk_index = 0
     start_time = time.time()
-    
+
     for idx, path in enumerate(files):
-        image_paths.append(str(path))
-        payload_item = {
-            "text": "",
-            "file_name": path.name,
-            "source_page": 1,
-            "chunk_index": idx,
-            "file_path": str(path.resolve()),
-        }
-        payload.append(payload_item)
-        file_results.append(FileIngestionResult(file_path=str(path), file_name=path.name, status=IngestionStatus.SUCCESS))
+        chunks, status, error_msg, ocr_engine_used, processing_time, current_chunk_index = extract_document_chunks_resilient(
+            path,
+            chunk_size,
+            use_code_parsing=False,
+            ocr_engine=ocr_engine,
+            chunk_index_offset=current_chunk_index,
+        )
+        file_results.append(
+            FileIngestionResult(
+                file_path=str(path),
+                file_name=path.name,
+                status=status,
+                chunks_count=len(chunks),
+                error_message=error_msg,
+                ocr_engine_used=ocr_engine_used,
+                processing_time_seconds=processing_time,
+            )
+        )
+        if status in {IngestionStatus.SUCCESS, IngestionStatus.WARNING}:
+            payload.extend(chunks)
 
         if on_progress is not None:
             on_progress({
                 "current_file": path.name,
-                "processed_files": idx,
+                "processed_files": idx + 1,
                 "total_files": len(files),
                 "chunk_count": len(payload),
-                "status": "success",
-                "error": ""
+                "status": status.value,
+                "error": error_msg,
             })
-    
-    embedder = ImageEmbeddingService()
-    vectors = embedder.embed_images(image_paths, batch_size=12)
-    
+
+    if not payload:
+        raise ValueError("No OCR text could be extracted from the provided images.")
+
+    embedder = EmbeddingService()
+    texts = [item["text"] for item in payload]
+    vectors = embedder.embed(texts, batch_size=12)
+
     vector_store = LocalVectorStore(Path(store_path))
     vector_store.build(vectors, payload)
-    
+
     total_time = time.time() - start_time
+    successful_files = sum(1 for result in file_results if result.status == IngestionStatus.SUCCESS)
+    warning_files = sum(1 for result in file_results if result.status == IngestionStatus.WARNING)
+    error_files = sum(1 for result in file_results if result.status == IngestionStatus.ERROR)
     report = IngestionReport(
-        total_files=len(files), processed_files=len(files), successful_files=len(files), warning_files=0, error_files=0, skipped_files=0,
-        total_chunks=len(payload), completed_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"), processing_time_seconds=total_time, file_results=file_results, success_rate=100.0,
+        total_files=len(files),
+        processed_files=successful_files + warning_files + error_files,
+        successful_files=successful_files,
+        warning_files=warning_files,
+        error_files=error_files,
+        skipped_files=0,
+        total_chunks=len(payload),
+        completed_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        processing_time_seconds=total_time,
+        file_results=file_results,
+        success_rate=((successful_files / max(successful_files + warning_files + error_files, 1)) * 100.0),
     )
     legacy_report = {
         "file_count": len(files),
@@ -1768,11 +1846,14 @@ def index_image_documents(
         "completed_at": report.completed_at,
         "index_path": str(Path(store_path).resolve()),
         "faiss_enabled": vector_store.faiss_enabled,
-        "success_rate": 100.0,
-        "error_files": 0,
+        "success_rate": report.success_rate,
+        "error_files": error_files,
     }
     with (Path(store_path) / "index_status.json").open("w", encoding="utf-8") as fh:
         json.dump(legacy_report, fh, indent=2)
+
+    with (Path(store_path) / "ingestion_report.json").open("w", encoding="utf-8") as fh:
+        json.dump(report.to_dict(), fh, indent=2)
 
     return IndexReport(
         file_count=len(files), chunk_count=len(payload), completed_at=report.completed_at, index_path=str(Path(store_path).resolve()), faiss_enabled=vector_store.faiss_enabled
@@ -1786,39 +1867,36 @@ def search_image_chunks(
     retrieval_mode: str = "vector",
     bm25_weight: float = 0.4,
 ) -> list[dict[str, Any]]:
-    embedder = ImageEmbeddingService()
-    query_vec = embedder.embed_text([query])[0]
-    
     store = LocalVectorStore(Path(store_path))
     if not store.load() or not store.ready():
         raise RuntimeError("Image index is not loaded. Please index images first.")
-    
-    if store.index is None:
-        raise RuntimeError("FAISS is required for Semantic Search.")
 
-    k = min(top_k, len(store.metadata))
-    if k == 0:
-        return []
+    retriever = HybridRetriever(store, EmbeddingService())
+    if BM25Okapi is not None:
+        retriever.build_bm25_index(store.metadata)
 
-    D, I = store.index.search(np.array([query_vec], dtype=np.float32), k)
-    
+    if retrieval_mode == "vector":
+        hits = retriever.search_vector(query, top_k)
+    elif retrieval_mode == "hybrid":
+        hits = retriever.search_hybrid(query, top_k, bm25_weight)
+    elif retrieval_mode == "hybrid+rerank":
+        candidates = retriever.search_hybrid(query, top_k * 2, bm25_weight)
+        hits = retriever.rerank_with_cross_encoder(query, candidates, top_k)
+    else:
+        hits = retriever.search_vector(query, top_k)
+
     results = []
-    for i in range(len(I[0])):
-        idx = int(I[0][i])
-        dist = float(D[0][i])
-        if idx < 0 or idx >= len(store.metadata):
-            continue
-            
-        m = store.metadata[idx]
+    for hit in hits:
+        m = hit.metadata
         results.append({
             "file_path": m.get("file_path", ""),
             "file_name": m.get("file_name", "unknown"),
-            "score": dist,
+            "score": hit.score,
             "chunk_index": m.get("chunk_index"),
             "text": m.get("text", ""),
-            "bbox": None,
-            "bounding_boxes": [],
-            "block_ids": [],
+            "bbox": m.get("bbox"),
+            "bounding_boxes": m.get("bounding_boxes", []),
+            "block_ids": m.get("block_ids", []),
         })
     return results
 
@@ -2019,8 +2097,10 @@ def system_checks(store_path: str, model_name: str = "", endpoint: str = "http:/
         "ollama_model_available": ollama_model_available,
     }
 
+_DIAGNOSTICS_CACHE: dict[str, dict[str, Any]] = {}
 
 def vector_diagnostics(store_path: str, sample_size: int = 500) -> dict[str, Any]:
+    global _DIAGNOSTICS_CACHE
     store = LocalVectorStore(Path(store_path))
     if not store.load() or not store.ready():
         return {
@@ -2030,6 +2110,11 @@ def vector_diagnostics(store_path: str, sample_size: int = 500) -> dict[str, Any
             "dim": 0,
             "points": [],
         }
+
+    current_count = int(store.index.ntotal if store.index is not None else len(store.metadata))
+    cache_key = f"{store_path}_{current_count}_{sample_size}"
+    if cache_key in _DIAGNOSTICS_CACHE:
+        return _DIAGNOSTICS_CACHE[cache_key]
 
     vectors = store.sample_vectors(sample_size=sample_size)
     if vectors.size == 0:
@@ -2062,10 +2147,16 @@ def vector_diagnostics(store_path: str, sample_size: int = 500) -> dict[str, Any
             }
         )
 
-    return {
+    result = {
         "ready": True,
         "message": "Vector diagnostics available.",
-        "vector_count": int(store.index.ntotal if store.index is not None else len(vectors)),
+        "vector_count": current_count,
         "dim": int(vectors.shape[1]),
         "points": points,
     }
+    
+    if len(_DIAGNOSTICS_CACHE) > 5:
+        _DIAGNOSTICS_CACHE.clear()
+    _DIAGNOSTICS_CACHE[cache_key] = result
+    
+    return result

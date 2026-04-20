@@ -180,3 +180,59 @@ def test_image_index_and_search_fixture(monkeypatch, tmp_path: Path) -> None:
 def test_image_search_module_imports() -> None:
     module = importlib.import_module("image_search")
     assert hasattr(module, "main")
+
+
+def test_api_index_accepts_mixed_sources_and_preserves_folder_structure(monkeypatch, tmp_path: Path) -> None:
+    seen: dict[str, object] = {}
+    monkeypatch.setattr(api, "_config", lambda: _test_config(tmp_path))
+
+    def fake_index_documents(folder_path: str, chunk_size: int, store_path: str, on_progress=None):
+        root = Path(folder_path)
+        files = sorted(path.relative_to(root).as_posix() for path in root.rglob("*") if path.is_file())
+        seen["folder_path"] = folder_path
+        seen["files"] = files
+        return type("Report", (), {"file_count": len(files), "chunk_count": len(files), "index_path": store_path})()
+
+    monkeypatch.setattr(api, "index_documents", fake_index_documents)
+
+    client = TestClient(api.app)
+    response = client.post(
+        "/api/index",
+        data={
+            "sources": json.dumps([
+                {"file_index": 0, "data_type": "pdf", "relative_path": "docs/specs/plan.pdf"},
+                {"file_index": 1, "data_type": "image", "relative_path": "images/diagram.png"},
+            ]),
+        },
+        files=[
+            ("files", ("plan.pdf", b"pdf-bytes", "application/pdf")),
+            ("files", ("diagram.png", b"image-bytes", "image/png")),
+        ],
+    )
+    payload = response.json()
+
+    assert response.status_code == 200
+    assert payload["success"] is True
+    assert seen["files"] == ["docs/specs/plan.pdf", "images/diagram.png"]
+
+
+def test_api_image_index_rejects_non_image_uploads(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(api, "_config", lambda: _test_config(tmp_path))
+    client = TestClient(api.app)
+
+    response = client.post(
+        "/api/image/index",
+        data={
+            "sources": json.dumps([
+                {"file_index": 0, "data_type": "pdf", "relative_path": "docs/spec.pdf"},
+            ]),
+        },
+        files=[
+            ("files", ("spec.pdf", b"pdf-bytes", "application/pdf")),
+        ],
+    )
+    payload = response.json()
+
+    assert response.status_code == 400
+    assert payload["success"] is False
+    assert "only accepts image inputs" in payload["error"]

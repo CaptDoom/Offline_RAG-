@@ -9,14 +9,19 @@ document.addEventListener('DOMContentLoaded', () => {
     const runtimePill = document.getElementById('python-runtime');
     const imageIndexBtn = document.getElementById('image-index-btn');
     const imageIndexClearBtn = document.getElementById('image-index-clear-btn');
-    const imageBrowseBtn = document.getElementById('image-browse-btn');
+    const imageBrowseFileBtn = document.getElementById('image-browse-file-btn');
+    const imageBrowseDirBtn = document.getElementById('image-browse-dir-btn');
     const imageFolderPath = document.getElementById('image-folder-path');
     const imageFilesInput = document.getElementById('image-file-input');
+    const imageDirInput = document.getElementById('image-dir-input');
     const imageSearchBtn = document.getElementById('image-search-btn');
     const imageQueryInput = document.getElementById('image-query');
     const imageResultsGrid = document.getElementById('image-results-grid');
     const imageChunkCount = document.getElementById('image-chunk-count');
     const imageIndexStatus = document.getElementById('image-index-status');
+    const mainSourceSummary = document.getElementById('main-source-summary');
+    const imageSourceSummary = document.getElementById('image-source-summary');
+    const folderPathInput = document.getElementById('folder-path');
 
     function escapeHtml(value) {
         return String(value || '')
@@ -29,6 +34,99 @@ document.addEventListener('DOMContentLoaded', () => {
 
     function renderRichText(text) {
         return escapeHtml(text).replace(/\n/g, '<br>');
+    }
+
+    function detectDataType(file) {
+        const name = String(file?.name || '').toLowerCase();
+        if (name.endsWith('.pdf')) return 'pdf';
+        if (/\.(png|jpg|jpeg|gif|bmp|tiff|tif|webp|svg)$/i.test(name)) return 'image';
+        if (name.endsWith('.zip')) return 'archive';
+        return 'document';
+    }
+
+    function summarizeSources(files, labelOverrides = {}) {
+        const summary = {
+            total: files.length,
+            folders: 0,
+            pdfs: 0,
+            images: 0,
+            archives: 0,
+            documents: 0,
+        };
+
+        files.forEach((file) => {
+            if (file?.webkitRelativePath) summary.folders += 1;
+            const type = detectDataType(file);
+            if (type === 'pdf') summary.pdfs += 1;
+            else if (type === 'image') summary.images += 1;
+            else if (type === 'archive') summary.archives += 1;
+            else summary.documents += 1;
+        });
+
+        return [
+            { label: labelOverrides.total || 'TOTAL', value: summary.total },
+            { label: labelOverrides.folders || 'FOLDER ITEMS', value: summary.folders },
+            { label: labelOverrides.pdfs || 'PDFS', value: summary.pdfs },
+            { label: labelOverrides.images || 'IMAGES', value: summary.images },
+            { label: labelOverrides.documents || 'DOCS', value: summary.documents },
+            { label: labelOverrides.archives || 'ARCHIVES', value: summary.archives },
+        ].filter((item) => item.value > 0);
+    }
+
+    function renderSourceSummary(container, items) {
+        if (!container) return;
+        if (!items.length) {
+            container.innerHTML = '';
+            return;
+        }
+        container.innerHTML = items
+            .map((item) => `<span class="source-pill"><strong>${escapeHtml(item.value)}</strong> ${escapeHtml(item.label)}</span>`)
+            .join('');
+    }
+
+    function fileListToArray(fileList) {
+        return Array.from(fileList || []);
+    }
+
+    function updateMainSelectionSummary() {
+        const allFiles = [
+            ...fileListToArray(mainFileInput?.files),
+            ...fileListToArray(mainDirInput?.files),
+        ];
+        folderPathInput.value = allFiles.length > 0 ? `[${allFiles.length} sources selected]` : '';
+        renderSourceSummary(mainSourceSummary, summarizeSources(allFiles));
+    }
+
+    function updateImageSelectionSummary() {
+        const allFiles = [
+            ...fileListToArray(imageFilesInput?.files),
+            ...fileListToArray(imageDirInput?.files),
+        ];
+        imageFolderPath.value = allFiles.length > 0 ? `[${allFiles.length} image sources selected]` : '';
+        renderSourceSummary(
+            imageSourceSummary,
+            summarizeSources(allFiles, { documents: 'NON-IMAGE' }).filter((item) => item.label !== 'DOCS' || item.value > 0),
+        );
+    }
+
+    function appendStructuredUploads(formData, files, inputKind, indexOffset = 0) {
+        const sources = [];
+        let currentIndex = indexOffset;
+        files.forEach((file) => {
+            formData.append('files', file);
+            sources.push({
+                kind: 'upload',
+                input_kind: inputKind,
+                data_type: detectDataType(file),
+                file_index: currentIndex,
+                file_name: file.name,
+                relative_path: file.webkitRelativePath || file.name,
+                mime_type: file.type || '',
+                size: Number(file.size || 0),
+            });
+            currentIndex += 1;
+        });
+        return { sources, nextIndex: currentIndex };
     }
 
     function switchView(target) {
@@ -142,18 +240,28 @@ document.addEventListener('DOMContentLoaded', () => {
     imageIndexClearBtn.addEventListener('click', () => {
         imageFolderPath.value = '';
         imageFilesInput.value = '';
+        if (imageDirInput) imageDirInput.value = '';
         imageResultsGrid.innerHTML = '';
         imageIndexStatus.textContent = 'OFFLINE';
+        renderSourceSummary(imageSourceSummary, []);
     });
-    imageBrowseBtn.addEventListener('click', (event) => {
+    imageBrowseFileBtn.addEventListener('click', (event) => {
         event.preventDefault();
         imageFilesInput.click();
     });
+    imageBrowseDirBtn.addEventListener('click', (event) => {
+        event.preventDefault();
+        if (imageDirInput) imageDirInput.click();
+    });
     
     imageFilesInput.addEventListener('change', () => {
-        const count = imageFilesInput.files ? imageFilesInput.files.length : 0;
-        imageFolderPath.value = count > 0 ? `[Selected ${count} images]` : '';
+        updateImageSelectionSummary();
     });
+    if (imageDirInput) {
+        imageDirInput.addEventListener('change', () => {
+            updateImageSelectionSummary();
+        });
+    }
 
     function updateDebugLogs(debug) {
         if (!debug || !Object.keys(debug).length) return;
@@ -238,19 +346,21 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     async function indexImages() {
-        const path = imageFolderPath.value.trim();
         const sidebarStatus = document.getElementById('image-index-status');
         sidebarStatus.textContent = 'INDEXING...';
 
         const formData = new FormData();
-        if (path) {
-            formData.append('folder_path', path);
+        const imageFiles = [
+            ...fileListToArray(imageFilesInput?.files),
+            ...fileListToArray(imageDirInput?.files),
+        ];
+        if (!imageFiles.length) {
+            sidebarStatus.textContent = 'OFFLINE';
+            alert('Select image files or an image folder first.');
+            return;
         }
-        if (imageFilesInput.files) {
-            for (const file of imageFilesInput.files) {
-                formData.append('files', file);
-            }
-        }
+        const payload = appendStructuredUploads(formData, imageFiles, 'image');
+        formData.append('sources', JSON.stringify(payload.sources));
 
         try {
             const response = await fetch('/api/image/index', { method: 'POST', body: formData });
@@ -269,35 +379,47 @@ document.addEventListener('DOMContentLoaded', () => {
 
     const indexFilesBtn = document.getElementById('index-files-btn');
     const mainFileInput = document.getElementById('main-file-input');
-    const browseBtn = document.getElementById('browse-btn');
+    const mainDirInput = document.getElementById('main-dir-input');
+    const browseFileBtn = document.getElementById('browse-file-btn');
+    const browseDirBtn = document.getElementById('browse-dir-btn');
     
-    if (browseBtn && mainFileInput) {
-        browseBtn.addEventListener('click', (e) => {
+    if (browseFileBtn && mainFileInput) {
+        browseFileBtn.addEventListener('click', (e) => {
             e.preventDefault();
             mainFileInput.click();
         });
+        browseDirBtn.addEventListener('click', (e) => {
+            e.preventDefault();
+            if (mainDirInput) mainDirInput.click();
+        });
         
         mainFileInput.addEventListener('change', () => {
-            const count = mainFileInput.files ? mainFileInput.files.length : 0;
-            document.getElementById('folder-path').value = count > 0 ? `[Selected ${count} files]` : '';
+            updateMainSelectionSummary();
         });
+        if (mainDirInput) {
+            mainDirInput.addEventListener('change', () => {
+                updateMainSelectionSummary();
+            });
+        }
     }
 
     if (indexFilesBtn) {
         indexFilesBtn.addEventListener('click', async () => {
-            const path = document.getElementById('folder-path').value.trim();
             const sidebarStatus = document.getElementById('sidebar-index-ready');
             sidebarStatus.textContent = 'INDEXING...';
 
             const formData = new FormData();
-            if (path && !path.startsWith('[')) {
-                formData.append('folder_path', path);
+            const mainFiles = [
+                ...fileListToArray(mainFileInput?.files),
+                ...fileListToArray(mainDirInput?.files),
+            ];
+            if (!mainFiles.length) {
+                sidebarStatus.textContent = 'READY';
+                alert('Select files, images, PDFs, or folders first.');
+                return;
             }
-            if (mainFileInput && mainFileInput.files) {
-                for (const file of mainFileInput.files) {
-                    formData.append('files', file);
-                }
-            }
+            const payload = appendStructuredUploads(formData, mainFiles, 'document');
+            formData.append('sources', JSON.stringify(payload.sources));
 
             try {
                 const response = await fetch('/api/index', { method: 'POST', body: formData });
@@ -314,6 +436,9 @@ document.addEventListener('DOMContentLoaded', () => {
             }
         });
     }
+
+    updateMainSelectionSummary();
+    updateImageSelectionSummary();
 
     const batchRunBtn = document.getElementById('batch-run-btn');
     const batchClearBtn = document.getElementById('batch-clear-btn');

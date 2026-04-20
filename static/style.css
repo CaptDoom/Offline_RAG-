@@ -222,12 +222,60 @@ body {
     background-color: rgba(0,0,0,0.5);
 }
 
+.input-row button {
+    background: rgba(255, 255, 255, 0.05);
+    color: var(--text-main);
+    border: 1px solid var(--border-color);
+    padding: 10px 12px;
+    font-size: 11px;
+    font-weight: 600;
+    font-family: var(--font-display);
+    letter-spacing: 0.05em;
+    cursor: pointer;
+    border-radius: var(--radius-sm);
+    transition: all 0.2s ease;
+}
+
+.input-row button:hover {
+    background: rgba(255, 255, 255, 0.1);
+    border-color: var(--accent);
+    color: white;
+}
+
 .status-row {
     display: flex;
     justify-content: space-between;
     font-size: 11px;
     margin-bottom: 14px;
     color: var(--text-muted);
+}
+
+.source-summary {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin: -4px 0 14px;
+    min-height: 24px;
+}
+
+.source-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 5px 9px;
+    border-radius: 999px;
+    border: 1px solid rgba(255,255,255,0.12);
+    background: rgba(255,255,255,0.05);
+    color: var(--text-muted);
+    font-family: var(--font-mono);
+    font-size: 10px;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+}
+
+.source-pill strong {
+    color: var(--text-main);
+    font-weight: 700;
 }
 
 .status-ready {

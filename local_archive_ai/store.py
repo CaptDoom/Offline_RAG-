@@ -304,7 +304,11 @@ class LocalVectorStore:
         scores = self.bm25.get_scores(tokens)
         if len(scores) == 0:
             return []
-        ranked = np.argsort(scores)[::-1][:top_k]
+        if len(scores) <= top_k:
+            ranked = np.argsort(scores)[::-1]
+        else:
+            idx = np.argpartition(scores, -top_k)[-top_k:]
+            ranked = idx[np.argsort(scores[idx])[::-1]]
         hits: list[SearchHit] = []
         for idx in ranked:
             if idx < 0 or idx >= len(self.metadata):

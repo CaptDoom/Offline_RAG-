@@ -130,7 +130,9 @@ def main() -> None:
                         tmp_dir = tempfile.TemporaryDirectory(prefix="local_archive_image_")
                         for upload in uploads:
                             if upload.name:
-                                (Path(tmp_dir.name) / upload.name).write_bytes(upload.getbuffer())
+                                target_path = Path(tmp_dir.name) / upload.name
+                                target_path.parent.mkdir(parents=True, exist_ok=True)
+                                target_path.write_bytes(upload.getbuffer())
                         folder_to_index = tmp_dir.name
 
                     report = index_image_documents(
